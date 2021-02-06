@@ -314,7 +314,7 @@ using (var powershell = PowerShell.Create())
 
     foreach (Process process in processes)
     {
-        Console.WriteLine($"Process '{process.Name}' ({process.Id})");
+        Console.WriteLine($"Process '{process.ProcessName}' ({process.Id})");
     }
 }
 ```
@@ -339,7 +339,7 @@ using (var powershell = PowerShell.Create())
 
     foreach (Process process in processes)
     {
-        Console.WriteLine($"Process '{process.Name}' ({process.Id})");
+        Console.WriteLine($"Process '{process.ProcessName}' ({process.Id})");
     }
 }
 ```
@@ -575,6 +575,125 @@ This will print something like:
 ...
 ```
 
+You can also do things like clear each stream.
+For example, clearing the error stream, just like `$error.Clear()` in PowerShell:
+
+```csharp
+powershell.Streams.Error.Clear();
+```
+
+There's also a way to do this with all the streams at once:
+
+```csharp
+powershell.Streams.ClearStreams();
+```
+
+One last thing that's common to do in PowerShell script is *redirecting* streams.
+This is, unfortunately, not as easy to accomplish with the `PowerShell` API directly.
+But because we're hosting this from .NET,
+there's no shortage of ways to accomplish what we need.
+
+In the case of redirecting a stream to a file,
+there's actually no way to do this at the API level.
+
+To redirect the output stream, the simplest way is to use `Out-File` instead
+(this is what `>` actually translates to anyway):
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    powershell
+        .AddCommand("Get-ChildItem")
+            .AddParameter("LiteralPath", "C:\\Users\\")
+        .AddCommand("Out-File")
+            .AddParameter("LiteralPath", "C:\\files.txt")
+        .Invoke();
+}
+```
+
+For other streams, we have to fall back to doing something a bit more creative at the .NET level.
+Each stream is actually a `PSDataCollection<T>` (where `T` is that stream's record type),
+which supports the `DataAdded` event,
+meaning we can do something like this:
+
+```csharp
+string logFilePath = "log.txt";
+
+using (var powershell = PowerShell.Create())
+using (var log = new StreamWriter(logFilePath))
+{
+    // Here we handle Verbose records, writing any emitted to the Verbose stream to a configured log file
+    powershell.Streams.Verbose.DataAdded += (object sender, DataAddedEventArgs args) => {
+        VerboseRecord verboseRecord = powershell.Streams.Verbose[args.Index];
+        log.WriteLine($"VERBOSE: {verboseRecord}");
+    };
+
+    // And here we handle Information records in the same way
+    // (this means that we can actually redirect Write-Host, since that emits Information records since PS 5.1)
+    powershell.Streams.Information.DataAdded += (object sender, DataAddedEventArgs args) => {
+        InformationRecord infoRecord = powershell.Streams.Information[args.Index];
+        log.WriteLine($"INFO: {infoRecord}");
+    };
+
+    powershell
+        .AddCommand("Import-Module")
+            .AddParameter("Name", "PSScriptAnalyzer")
+            .AddParameter("Verbose")
+        .AddStatement()
+        .AddCommand("Write-Host")
+            .AddParameter("Object", "Importing done")
+        .Invoke();
+}
+```
+
+Running this, we end up with the log file looking like this:
+
+```text
+VERBOSE: Loading module from path 'C:\Users\me\Documents\PowerShell\Modules\PSScriptAnalyzer\1.19.0\PSScriptAnalyzer.psd1'.
+VERBOSE: Loading 'TypesToProcess' from path 'C:\Users\me\Documents\PowerShell\Modules\PSScriptAnalyzer\1.19.0\ScriptAnalyzer.types.ps1xml'.
+VERBOSE: Loading 'FormatsToProcess' from path 'C:\Users\me\Documents\PowerShell\Modules\PSScriptAnalyzer\1.19.0\ScriptAnalyzer.format.ps1xml'.
+VERBOSE: Populating RepositorySourceLocation property for module PSScriptAnalyzer.
+VERBOSE: Loading module from path 'C:\Users\me\Documents\PowerShell\Modules\PSScriptAnalyzer\1.19.0\PSScriptAnalyzer.psm1'.
+VERBOSE: Exporting function 'RuleNameCompleter'.
+VERBOSE: Exporting cmdlet 'Get-ScriptAnalyzerRule'.
+VERBOSE: Exporting cmdlet 'Invoke-Formatter'.
+VERBOSE: Exporting cmdlet 'Invoke-ScriptAnalyzer'.
+VERBOSE: Importing cmdlet 'Get-ScriptAnalyzerRule'.
+VERBOSE: Importing cmdlet 'Invoke-Formatter'.
+VERBOSE: Importing cmdlet 'Invoke-ScriptAnalyzer'.
+INFO: Importing done
+```
+
+One stream functionality that is supported at an API level is *merging* streams
+(although only via the `PSCommand` API, which we'll look at a bit more in-depth later).
+
+For example, let's say we want to run something like this command:
+
+```powershell
+Get-ChildItem -LiteralPath 'exists','doesnotexist' 2>&1
+```
+
+This can be implemented with the `PowerShell` API as follows:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    powershell
+        .AddCommand("Get-ChildItem")
+            .AddParameter("LiteralPath", new [] { "exists", "doesnotexist" });
+
+    // We must crack open the Commands property on the PowerShell object
+    // and manipulate the PSCommand object that holds our built command
+    powershell.Commands.Commands[0].MergeMyResults(PipelineResultTypes.Error, PipelineResultTypes.Output);
+
+    Collection<PSObject> results = powershell.Invoke();
+    foreach (PSObject result in results)
+    {
+        Console.WriteLine(result);
+    }
+}
+```
+
 ### Dealing with formatting
 
 We've been printing a lot in the examples we've looked at (because it's an easy way to present output),
@@ -725,21 +844,299 @@ but in that case `Out-Default` should be used instead of `Out-String`.
 One thing you might find yourself wanting to do is running multiple invocations
 using the same `PowerShell` instance.
 
-You'll notice that if you try to simply run multiple commands in sequence from the same instance
-you might get a strange result:
+It might seem that the right way to do this is something like this:
 
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    string path = "./file.txt";
+
+    FileSystemInfo file = powershell
+        .AddCommand("New-Item")
+            .AddParameter("Path", path)
+            .AddParameter("Value", "Hello!")
+            .AddParameter("Force")
+        .Invoke<FileSystemInfo>()
+        .FirstOrDefault();
+
+    Console.WriteLine($"Created file at path: '{file.FullName}'");
+
+    string content = powershell
+        .AddCommand("Get-Content")
+            .AddParameter("Raw")
+            .AddParameter("LiteralPath", path)
+        .Invoke<string>()
+        .FirstOrDefault();
+
+    Console.WriteLine($"Got file content: '{content}'");
+}
 ```
 
+However, if you run this you will notice that `content` is an empty string,
+even though we just set it to `Hello!`.
+
+This is because the `PowerShell` object statefully accrues commands as they are added with `AddCommand()`,
+so the second PowerShell invocation isn't quite what we thought it would be.
+
+Instead, we need to clear the commands between invocations:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    string path = "./file.txt";
+
+    FileSystemInfo file = powershell
+        .AddCommand("New-Item")
+            .AddParameter("Path", path)
+            .AddParameter("Value", "Hello!")
+            .AddParameter("Force")
+        .Invoke<FileSystemInfo>()
+        .FirstOrDefault();
+
+    Console.WriteLine($"Created file at path: '{file.FullName}'");
+
+    // Clear the PowerShell object command builder state here
+    powershell.Commmands.Clear();
+
+    string content = powershell
+        .AddCommand("Get-Content")
+            .AddParameter("Raw")
+            .AddParameter("LiteralPath", path)
+        .Invoke<string>()
+        .FirstOrDefault();
+
+    Console.WriteLine($"Got file content: '{content}'");
+}
+```
+
+This may seem inconvenient, but it's fairly easy to simplify
+by defining some extension methods:
+
+```csharp
+internal static class PowerShellExtensions
+{
+    public static Collection<T> InvokeAndClear<T>(this PowerShell powershell)
+    {
+        try
+        {
+            return powershell.Invoke<T>();
+        }
+        finally
+        {
+            powershell.Commands.Clear();
+        }
+    }
+
+    public static Collection<PSObject> InvokeAndClear(this PowerShell powershell)
+    {
+        try
+        {
+            return powershell.Invoke();
+        }
+        finally
+        {
+            powershell.Commands.Clear();
+        }
+    }
+}
+
+public class Program
+{
+    public static void Main(string[] args)
+    {
+        using (var powershell = PowerShell.Create())
+        {
+            string result = powershell
+                .AddCommand("Get-Content")
+                    .AddParameter("-Raw")
+                    .AddParameter("-LiteralPath", "./hello.txt")
+                .InvokeAndClear<string>()
+                .FirstOrDefault();
+
+            Console.WriteLine($"Greeting: '{result}'");
+        }
+    }
+}
 ```
 
 ### Using `PSInvocationSettings` to configure your invocation
 
+If you've been playing around with the `PowerShell.Invoke()` method,
+you have have noticed it has a few overloads that take various parameters.
+
+We've already discussed a few of them,
+such as `IEnumerable input` and `IList<T> output`,
+but another important possible parameter is `PSInvocationSettings settings`.
+
+This is an object you can use to configure your PowerShell configuration,
+explained in the documentation [here](https://docs.microsoft.com/dotnet/api/system.management.automation.psinvocationsettings).
+
+The documentation gives a decent outline of the meaning of each configuration property,
+but here's an example:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    var settings = new PSInvocationSettings
+    {
+        AddToHistory = true,
+        ErrorActionPreference = ActionPreference.Stop,
+    };
+
+    // Note that the Invoke() overloads that take PSInvocationSettings
+    // also require a value for input.
+    // It's fine to pass in null when there's no input to provide.
+    powershell
+        .AddCommand("Remove-Item")
+            .AddParameter("Path", "./temp/*")
+        .Invoke(input: null, settings);
+}
+```
+
+Based on the settings provided:
+
+- If `Remove-Item` fails, it will throw a terminating error thanks to the `ErrorActionPreference` value.
+- The runspace `Remove-Item` is run in will have that invocation added to its history.
+  So, for example, if `Remove-Item` has been run on a runspace that is also going to be used interactively later,
+  then a user looking through their history will see this invocation recorded.
+
 ### `PowerShell` vs `PSCommand`
+
+Another thing we touched on briefly above
+is that there's another API exposed by the PowerShell SDK
+for command construction.
+
+That API is the `PSCommand` API and it's almost identical to the `PowerShell` API
+when it comes to building a command for invocation.
+
+Here's an example from earlier rebuilt to use the `PSCommand` API:
+
+```csharp
+var command = new PSCommand()
+    .AddCommand("Get-Process")
+    .AddCommand("Sort-Object")
+        .AddParameter("Property", "WS")
+        .AddParameter("Descending")
+    .AddCommand("Select-Object")
+        .AddParameter("First", 10);
+
+using (var powershell = PowerShell.Create())
+{
+    powershell.Commands = command;
+
+    Collection<Process> processes = powershell.Invoke<Process>();
+
+    foreach (Process process in processes)
+    {
+        Console.WriteLine($"Process '{process.ProcessName}' ({process.Id})");
+    }
+}
+```
+
+Two very nice things about this are:
+
+- We have a nice, discrete object to represent a command
+  that's totally separate from the `PowerShell` API
+  (which we can just fall back to using as an invocation engine).
+  So we can now separate out our command building from our command execution.
+- We can construct a `PSCommand` object once,
+  move it through our code if we want to, and even reuse it.
+  So we could take the same PSCommand and run it on a series of `PowerShell` objects.
+
+It turns out that these nice-to-have requirements aren't all that common,
+but they can be good if you're trying to do something
+like build arbitrary commands from user input
+and then execute them against a central runtime (e.g. in a PowerShell Host).
+
+There are a couple of caveats with the `PSCommand` API however,
+which are more oversights than intentional hurdles:
+
+- You can't build a `PSCommand` with the command taken from a `CommandInfo`
+  (at least not without using reflection).
+- Assigning the `PSCommand` to a `PowerShell` object clones that `PSCommand`,
+  which in older versions of PowerShell can cause some properties to be lost.
 
 ### API style tips
 
-The first thing to note about the PowerShell API is that it offers a *fluent* interface,
-where method chaining is used to build the object state.
+As a final note on the basics of using the `PowerShell` API,
+it's worth talking briefly about coding style when using the API.
+
+Just like PowerShell itself, there's often not one right way to write code or use an API,
+but it's worth noting that the `PowerShell` API offers a *fluent* interface.
+
+That means that while you can do this:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    powershell.AddCommand("Get-ChildItem");
+    powershell.AddParameter("Path", "./here");
+    powershell.AddParameter("Recurse");
+    powershell.AddCommand("Where-Object");
+    powershell.AddParameter("Property", "Name");
+    powershell.AddParameter("Like");
+    powershell.AddParameter("Value", "*.txt");
+    powershell.AddCommand("Select-Object");
+    powershell.AddParameter("First", 10);
+
+    Collection<PSObject> results = powershell.Invoke();
+    foreach (PSObject result in results)
+    {
+        Console.WriteLine(((FileSystemInfo)result.BaseObject).FullName);
+    }
+}
+```
+
+It's likely going to be much faster to write and easier to read something like this:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    Collection<FileSystemInfo> results = powershell
+        .AddCommand("Get-ChildItem")
+            .AddParameter("Path", "./here")
+            .AddParameter("Recurse")
+        .AddCommand("Where-Object")
+            .AddParameter("Property", "Name")
+            .AddParameter("Like")
+            .AddParameter("Value", "*.txt")
+        .AddCommand("Select-Object")
+            .AddParameter("First", 10)
+        .Invoke<FileSystemInfo>();
+
+    foreach (FileSystemInfo result in results)
+    {
+        Console.WriteLine(result.FullName);
+    }
+}
+```
+
+Naturally you might find you prefer a different way to indent,
+or prefer to keep the invocation separate from the command building,
+or prefer to invoke directly into the `foreach` loop enumerable expression.
+But generally it's advised to use the fluent API as method chains,
+much as you might for LINQ.
+
+As we've noted earlier, this interface does dovetail nicely with LINQ.
+For example, we can easily transform some of the above invocation to use LINQ instead:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    IEnumerable<FileSystemInfo> results = powershell
+        .AddCommand("Get-ChildItem")
+            .AddParameter("Path", "./here")
+            .AddParameter("Recurse")
+        .Invoke<FileSystemInfo>()
+        .Where(fsi => fsi.Name.EndsWith(".txt"))
+        .Take(10);
+
+    foreach (FileSystemInfo result in results)
+    {
+        Console.WriteLine(result.FullName);
+    }
+}
+```
 
 ## Runspaces, threads, async and the PowerShell API
 

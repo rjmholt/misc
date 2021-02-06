@@ -3,6 +3,10 @@ using System.Collections.Generic;
 using System.Management.Automation;
 using System.Linq;
 using System.IO;
+using System.Reflection;
+using System.Management.Automation.Runspaces;
+using System.Collections.ObjectModel;
+using System.Diagnostics;
 
 namespace psapi
 {
@@ -12,19 +16,18 @@ namespace psapi
         {
             using (var powershell = PowerShell.Create())
             {
-                DateTime date = powershell
-                    .AddCommand("Get-Date")
-                    .Invoke<DateTime>()
-                    .First();
+                IEnumerable<FileSystemInfo> results = powershell
+                    .AddCommand("Get-ChildItem")
+                        .AddParameter("Path", "./here")
+                        .AddParameter("Recurse")
+                    .Invoke<FileSystemInfo>()
+                    .Where(fsi => fsi.Name.EndsWith(".txt"))
+                    .Take(10);
 
-                Console.WriteLine(date);
-
-                DateTime secondDate = powershell
-                    .AddCommand("Get-Date")
-                    .Invoke<DateTime>()
-                    .First();
-
-                Console.WriteLine(secondDate);
+                foreach (FileSystemInfo result in results)
+                {
+                    Console.WriteLine(result.FullName);
+                }
             }
         }
     }

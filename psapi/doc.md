@@ -1114,7 +1114,7 @@ using (var powershell = PowerShell.Create())
 Naturally you might find you prefer a different way to indent,
 or prefer to keep the invocation separate from the command building,
 or prefer to invoke directly into the `foreach` loop enumerable expression.
-But generally it's advised to use the fluent API as method chains,
+But generally it's advised to use the method chaining style with the fluent API,
 much as you might for LINQ.
 
 As we've noted earlier, this interface does dovetail nicely with LINQ.
@@ -1140,9 +1140,41 @@ using (var powershell = PowerShell.Create())
 
 ## Runspaces, threads, async and the PowerShell API
 
-### Runspace configuration and disposal
+By this point, you hopefully have a fairly complete picture of using the `PowerShell` API
+to assemble and invoke PowerShell statements.
+This much is often sufficient for simple applications,
+but as our needs become more sophisticated,
+particularly with respect to threads,
+we must also ensure we manage how we run PowerShell more carefully.
 
-### Runspaces and state in PowerShell
+In particular, when we run PowerShell from .NET code,
+we must be mindful of its interaction with PowerShell *runspaces*.
+A runspace is essentially a context for PowerShell runtime state,
+holding things like the loaded modules, defined variables, commands and providers, and the current location.
+Whenever PowerShell code is run, it must be executed in some runspace.
+Usually, when scripts are run by `pwsh.exe`,
+they are run in a single-threaded way in the default runspace,
+meaning things behave as we expect.
+However, when PowerShell is run from .NET through something like the `PowerShell` API,
+the hosting context can mean our simplified assumptions no longer hold,
+and instead we must take care to configure how and where PowerShell is actually executed.
+
+### Configuring the runspace with `RunspaceMode`
+
+Until now, we've been using the simplest form of the `PowerShell.Create()` API.
+However, there are other overloads that allow us to better configure what runspace the invocation is run in.
+
+The simplest of these is `PowerShell.Create(RunspaceMode runspaceMode)`,
+which takes one of two possible enum values to determine where to derive its runspace at execution time.
+
+`RunspaceMode.NewRunspace` will always instantiate a new runspace
+in which to execute invocations on the created `PowerShell` instance.
+
+### Using your own runspace and runspace ownership
+
+### Managing runspace state with `InitialSessionState`
+
+### Fanning out with a `RunspacePool`
 
 ### Using the async API
 

@@ -16,18 +16,12 @@ namespace psapi
         {
             using (var powershell = PowerShell.Create())
             {
-                IEnumerable<FileSystemInfo> results = powershell
-                    .AddCommand("Get-ChildItem")
-                        .AddParameter("Path", "./here")
-                        .AddParameter("Recurse")
-                    .Invoke<FileSystemInfo>()
-                    .Where(fsi => fsi.Name.EndsWith(".txt"))
-                    .Take(10);
-
-                foreach (FileSystemInfo result in results)
-                {
-                    Console.WriteLine(result.FullName);
-                }
+                powershell
+                    .AddCommand("Import-Module")
+                        .AddParameter("Name", "PSScriptAnalyzer")
+                        .AddParameter("PassThru")
+                    .AddCommand("Out-Host")
+                    .Invoke();
             }
         }
     }

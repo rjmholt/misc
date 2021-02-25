@@ -1141,7 +1141,7 @@ using (var powershell = PowerShell.Create())
 ## Runspaces, threads, async and the PowerShell API
 
 By this point, you hopefully have a fairly complete picture of using the `PowerShell` API
-to assemble and invoke PowerShell statements.
+to assemble and invoke PowerShell statements in a synchronous, single-threaded way.
 This much is often sufficient for simple applications,
 but as our needs become more sophisticated,
 particularly with respect to threads,
@@ -1169,8 +1169,347 @@ which takes one of two possible enum values to determine where to derive its run
 
 `RunspaceMode.NewRunspace` will always instantiate a new runspace
 in which to execute invocations on the created `PowerShell` instance.
+And in fact this is the implicit default;
+`PowerShell.Create()` is the same as `PowerShell.Create(RunspaceMode.NewRunspace)`.
 
-### Using your own runspace and runspace ownership
+To see how a new runspace can change things, let's look at two examples.
+First an example where we run everything in the same runspace:
+
+```csharp
+using (var powershell = PowerShell.Create(RunspaceMode.NewRunspace))
+{
+    // Set $x = 2 and import PSScriptAnalyzer
+    IEnumerable<PSModuleInfo> modules = powershell
+        .AddScript("$x = 2")
+        .AddStatement()
+        .AddCommand("Import-Module")
+            .AddParameter("Name", "PSScriptAnalyzer")
+            .AddParameter("PassThru")
+        .Invoke<PSModuleInfo>();
+
+    Console.WriteLine("IMPORTED MODULES:");
+    foreach (PSModuleInfo module in modules)
+    {
+        Console.WriteLine($"{module.Name} [{module.Version}]");
+    }
+    Console.WriteLine();
+
+    powershell.Commands.Clear();
+
+    // Now list all loaded modules
+    IEnumerable<PSModuleInfo> loadedModules = powershell
+        .AddCommand("Get-Module")
+        .Invoke<PSModuleInfo>();
+    
+    Console.WriteLine("FOUND LOADED MODULES:");
+    foreach (PSModuleInfo module in loadedModules)
+    {
+        Console.WriteLine($"{module.Name} [{module.Version}]");
+    }
+    Console.WriteLine();
+
+    powershell.Commands.Clear();
+
+    // Now get the value of $x
+    IEnumerable<PSObject> results = powershell
+        .AddScript("$x")
+        .Invoke();
+
+    foreach (PSObject result in results)
+    {
+        Console.WriteLine($"$x = {result}");
+    }
+}
+```
+
+When we run this, we get the following output:
+
+```output
+IMPORTED MODULES:
+PSScriptAnalyzer [1.19.1]
+
+FOUND LOADED MODULES:
+PSScriptAnalyzer [1.19.1]
+
+$x = 2
+```
+
+Now let's try with two separate `PowerShell` objects,
+each creating a new runspace:
+
+```csharp
+using (var powershell = PowerShell.Create(RunspaceMode.NewRunspace))
+{
+    // Set $x = 2 and import PSScriptAnalyzer
+    IEnumerable<PSModuleInfo> modules = powershell
+        .AddScript("$x = 2")
+        .AddStatement()
+        .AddCommand("Import-Module")
+            .AddParameter("Name", "PSScriptAnalyzer")
+            .AddParameter("PassThru")
+        .Invoke<PSModuleInfo>();
+
+    Console.WriteLine("IMPORTED MODULES:");
+    foreach (PSModuleInfo module in modules)
+    {
+        Console.WriteLine($"{module.Name} [{module.Version}]");
+    }
+    Console.WriteLine();
+}
+
+using (var powershell = PowerShell.Create(RunspaceMode.NewRunspace))
+{
+    // Now list all loaded modules
+    IEnumerable<PSModuleInfo> loadedModules = powershell
+        .AddCommand("Get-Module")
+        .Invoke<PSModuleInfo>();
+    
+    Console.WriteLine("FOUND LOADED MODULES:");
+    foreach (PSModuleInfo module in loadedModules)
+    {
+        Console.WriteLine($"{module.Name} [{module.Version}]");
+    }
+    Console.WriteLine();
+
+    powershell.Commands.Clear();
+
+    // Now get the value of $x
+    IEnumerable<PSObject> results = powershell
+        .AddScript("$x")
+        .Invoke();
+
+    foreach (PSObject result in results)
+    {
+        Console.WriteLine($"$x = {result}");
+    }
+}
+```
+
+Running this, we now see the following output:
+
+```output
+IMPORTED MODULES:
+PSScriptAnalyzer [1.19.1]
+
+FOUND LOADED MODULES:
+
+$x =
+```
+
+You can see here then that because the first and second executions were run in fresh runspaces,
+the second execution does not find any modules loaded and nor is `$x` defined.
+Instead the runspace is totally pristine.
+
+This can be a source of confusion if you're assuming that all the PowerShell invocations you run
+are being executed in the same context; as you can see they are not.
+
+But what if we use `RunspaceMode.CurrentRunspace`? Let's change the code from the second example and find out:
+
+```csharp
+using (var powershell = PowerShell.Create(RunspaceMode.CurrentRunspace))
+{
+    // Set $x = 2 and import PSScriptAnalyzer
+    IEnumerable<PSModuleInfo> modules = powershell
+        .AddScript("$x = 2")
+        .AddStatement()
+        .AddCommand("Import-Module")
+            .AddParameter("Name", "PSScriptAnalyzer")
+            .AddParameter("PassThru")
+        .Invoke<PSModuleInfo>();
+
+    Console.WriteLine("IMPORTED MODULES:");
+    foreach (PSModuleInfo module in modules)
+    {
+        Console.WriteLine($"{module.Name} [{module.Version}]");
+    }
+    Console.WriteLine();
+}
+
+using (var powershell = PowerShell.Create(RunspaceMode.CurrentRunspace))
+{
+    // Now list all loaded modules
+    IEnumerable<PSModuleInfo> loadedModules = powershell
+        .AddCommand("Get-Module")
+        .Invoke<PSModuleInfo>();
+    
+    Console.WriteLine("FOUND LOADED MODULES:");
+    foreach (PSModuleInfo module in loadedModules)
+    {
+        Console.WriteLine($"{module.Name} [{module.Version}]");
+    }
+    Console.WriteLine();
+
+    powershell.Commands.Clear();
+
+    // Now get the value of $x
+    IEnumerable<PSObject> results = powershell
+        .AddScript("$x")
+        .Invoke();
+
+    foreach (PSObject result in results)
+    {
+        Console.WriteLine($"$x = {result}");
+    }
+}
+```
+
+In fact something bad and unexpected happens:
+
+```output
+Unhandled exception. System.InvalidOperationException: A PowerShell object cannot be created that uses the current runspace because there is no current runspace available.  The current runspace might be starting, such as when it is created with an Initial Session State.
+   at System.Management.Automation.PowerShell.Create(RunspaceMode runspace)
+   at psapi.Program.Main(String[] args) in C:\Users\me\psapi\Program.cs:line 17
+```
+
+We need to add two slightly magical lines to the top (which will be explained imminently):
+
+```csharp
+Runspace.DefaultRunspace = RunspaceFactory.CreateRunspace();
+Runspace.DefaultRunspace.Open();
+
+using (var powershell = PowerShell.Create(RunspaceMode.CurrentRunspace))
+{
+    // Set $x = 2 and import PSScriptAnalyzer
+    IEnumerable<PSModuleInfo> modules = powershell
+        .AddScript("$x = 2")
+        .AddStatement()
+        .AddCommand("Import-Module")
+            .AddParameter("Name", "PSScriptAnalyzer")
+            .AddParameter("PassThru")
+        .Invoke<PSModuleInfo>();
+
+    Console.WriteLine("IMPORTED MODULES:");
+    foreach (PSModuleInfo module in modules)
+    {
+        Console.WriteLine($"{module.Name} [{module.Version}]");
+    }
+    Console.WriteLine();
+}
+
+using (var powershell = PowerShell.Create(RunspaceMode.CurrentRunspace))
+{
+    // Now list all loaded modules
+    IEnumerable<PSModuleInfo> loadedModules = powershell
+        .AddCommand("Get-Module")
+        .Invoke<PSModuleInfo>();
+    
+    Console.WriteLine("FOUND LOADED MODULES:");
+    foreach (PSModuleInfo module in loadedModules)
+    {
+        Console.WriteLine($"{module.Name} [{module.Version}]");
+    }
+    Console.WriteLine();
+
+    powershell.Commands.Clear();
+
+    // Now get the value of $x
+    IEnumerable<PSObject> results = powershell
+        .AddScript("$x")
+        .Invoke();
+
+    foreach (PSObject result in results)
+    {
+        Console.WriteLine($"$x = {result}");
+    }
+}
+```
+
+And we are restored to original output:
+
+```output
+IMPORTED MODULES:
+PSScriptAnalyzer [1.19.1]
+
+FOUND LOADED MODULES:
+PSScriptAnalyzer [1.19.1]
+
+$x = 2
+```
+
+Ok, so what was the error we got before, what are the two lines we added,
+and why are they needed to make this work?
+
+The answer lies with `Runspace.DefaultRunspace`, which is a thread-static property
+(i.e. it's a per-thread global variable).
+When you call `PowerShell.Create(RunspaceMode.CurrentRunspace)`, it automatically uses `Runspace.DefaultRunspace`
+as the runspace for that `PowerShell` object.
+
+This is somewhat convenient for a scenario where you want to have PowerShell executions
+interpersed with other code or between methods,
+but there's a key scenario where it's much more important;
+when your invocation is being run on a thread where PowerShell has already created a runspace
+(i.e. PowerShell has called into your method and you want to run PowerShell in the calling runspace).
+
+The main example of this is with cmdlets, so we can define a cmdlet in C# like this:
+
+```csharp
+[Cmdlet(VerbsDiagnostic.Test, "RunspaceInheritance")]
+public class TestRunspaceInheritanceCommand : Cmdlet
+{
+    [Parameter(Mandatory = true)]
+    public string VariableName { get; set; }
+
+    protected override void EndProcessing()
+    {
+        using (var powershell = PowerShell.Create(RunspaceMode.CurrentRunspace))
+        {
+            IEnumerable<PSObject> results = powershell
+                .AddScript($"${VariableName}")
+                .Invoke();
+
+            foreach (PSObject result in results)
+            {
+                WriteObject(result);
+            }
+        }
+    }
+}
+```
+
+And then use it like this:
+
+```powershell
+> $x = 7
+> Test-RunspaceInheritance -VariableName x
+7
+```
+
+So, then, there are specific scenarios for `RunspaceMode.CurrentRunspace`:
+
+- Reusing the same runspace on the same thread, for example across method calls
+- Calling back into a runspace from .NET when the caller itself was PowerShell
+
+And bear in mind that away from these scenarios, to reuse a runspace, you will need a more careful solution.
+Examples where `RunspaceMode.CurrentRunspace` will be a trap include:
+
+- Anything with explicit thread changes, like `Task.Run()`, `Parallel.ForEach()` or `new Thread()`
+- Anything with possible implicit thread changes, like events or `async`, where a thread pool or handler thread may be doing the work
+- Methods/invocations where the running thread isn't well-defined (for example, static method calls, which are supposed to be threadsafe)
+
+Also bear in mind that the error we hit before when we didn't have `Runspace.DefaultRunspace` was a *good thing*;
+we set up a program without understanding some of its subtleties and we got a nice explicit failure.
+In the wild, you may end up running on a thread where `Runspace.DefaultRunspace` was set by something else,
+in which case you won't get an error, simply bad and hard-to-understand behavior.
+
+### Using and owning your own runspace
+
+One big difference between the `RunspaceMode.NewRunspace` and `RunspaceMode.CurrentRunspace` options
+that we looked at above was that in the first case we never had to deal with a `Runspace` object.
+Internally, when `RunspaceMode.NewRunspace` is used, a new runspace is created and opened
+and attached to the created `PowerShell` object,
+and that PowerShell object is tracked as *owning* that runspace,
+so that when it's disposed at the end of the `using` block, the runspace is also disposed of properly.
+
+However, when runspaces are not associated with a `PowerShell` object through `RunspaceMode.NewRunspace`,
+*we* are responsible for cleaning it up.
+This is important because runspaces really represent most of the overhead of executing PowerShell;
+because they're the sandbox in which PowerShell executes,
+they represent all the memory and caches and context,
+meaning that if we don't clean them up we may leak those resources until our application grinds to a halt.
+
+As described above, using `RunspaceMode.CurrentRunspace` can be an appropriate solution to this in certain scenarios,
+but often when you're running PowerShell from within a .NET application,
+the scenario is more complicated and so you must work harder to manage your runspace.
 
 ### Managing runspace state with `InitialSessionState`
 

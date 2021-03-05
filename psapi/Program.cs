@@ -17,49 +17,31 @@ namespace psapi
             Runspace.DefaultRunspace = RunspaceFactory.CreateRunspace();
             Runspace.DefaultRunspace.Open();
 
-            using (var powershell = PowerShell.Create(RunspaceMode.CurrentRunspace))
+            var parameters = new Dictionary<string, object>
             {
-                // Set $x = 2 and import PSScriptAnalyzer
-                IEnumerable<PSModuleInfo> modules = powershell
-                    .AddScript("$x = 2")
-                    .AddStatement()
-                    .AddCommand("Import-Module")
-                        .AddParameter("Name", "PSScriptAnalyzer")
-                        .AddParameter("PassThru")
-                    .Invoke<PSModuleInfo>();
+                { "x", "banana" },
+                { "y", "duck" },
+                { "z", "horsey" },
+            };
 
-                Console.WriteLine("IMPORTED MODULES:");
-                foreach (PSModuleInfo module in modules)
-                {
-                    Console.WriteLine($"{module.Name} [{module.Version}]");
-                }
-                Console.WriteLine();
-            }
+            string scriptLocation = Path.GetFullPath(
+                Path.Combine(
+                    Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location),
+                    "..",
+                    "..",
+                    "..",
+                    "ex.ps1"));
 
             using (var powershell = PowerShell.Create(RunspaceMode.CurrentRunspace))
             {
-                // Now list all loaded modules
-                IEnumerable<PSModuleInfo> loadedModules = powershell
-                    .AddCommand("Get-Module")
-                    .Invoke<PSModuleInfo>();
-                
-                Console.WriteLine("FOUND LOADED MODULES:");
-                foreach (PSModuleInfo module in loadedModules)
-                {
-                    Console.WriteLine($"{module.Name} [{module.Version}]");
-                }
-                Console.WriteLine();
-
-                powershell.Commands.Clear();
-
-                // Now get the value of $x
                 IEnumerable<PSObject> results = powershell
-                    .AddScript("$x")
+                    .AddCommand(scriptLocation)
+                    .AddParameters(parameters)
                     .Invoke();
 
                 foreach (PSObject result in results)
                 {
-                    Console.WriteLine($"$x = {result}");
+                    Console.WriteLine(result);
                 }
             }
         }

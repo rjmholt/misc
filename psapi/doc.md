@@ -287,6 +287,56 @@ This can be useful when:
   If this second case is required, `PSDataCollection<T>` may be a good option,
   since it provides for concurrent scenarios and has `DataAdded` and `DataAdding` events.
 
+### Scope and dot-sourcing
+
+You might notice that the `AddScript()` and `AddCommand()` methods have overloads
+that take a boolean called `useLocalScope`.
+
+By default, these methods run their arguments in the parent context.
+In the case of `AddScript()` this is the same as dot-sourcing that script.
+If instead you tell the command to use local scope,
+things like variables defined by that script will not persist beyond that script's execution
+(like an ordinary script invocation or an explicit use of the `&` operator).
+
+To see this in action, compare these two snippets:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    powershell.AddScript("$x = Get-Command Get-Item").Invoke();
+
+    // We'll cover what this means later
+    powershell.Commands.Clear();
+
+    Collection<PSObject> results = powershell.AddScript("$x").Invoke();
+
+    // Prints "Get-Item"
+    foreach (PSObject result in results)
+    {
+        Console.WriteLine(result);
+    }
+}
+```
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    powershell.AddScript("$x = Get-Command Get-Item", useLocalScope: true).Invoke();
+
+    powershell.Commands.Clear();
+
+    // Because the previous script executed in local scope,
+    // the scope $x was defined in is already gone, so $x has no value now
+    Collection<PSObject> results = powershell.AddScript("$x").Invoke();
+
+    // Prints nothing
+    foreach (PSObject result in results)
+    {
+        Console.WriteLine(result);
+    }
+}
+```
+
 ### Pipelines and statements
 
 In all the examples above, we've only looked at how to use the `PowerShell` API to invoke a single command.
@@ -1138,6 +1188,230 @@ using (var powershell = PowerShell.Create())
 }
 ```
 
+## Better ways to run PowerShell from cmdlets; the Intrinsics APIs and ScriptBlocks
+
+Because the focus of this document is running PowerShell using the `PowerShell` API,
+we've focused entirely on that so far.
+However, in certain contexts there are other ways available to run PowerShell script,
+and in some cases these can be the better option.
+
+Generally these APIs only work when your code has been called from and is running on the pipeline thread,
+and are intended to be used in the implementation of a cmdlet or provider.
+
+### The `InvokeCommand` property, or `CommandInvocationIntrinsics`
+
+Cmdlets inheriting from `PSCmdlet` and providers all have an `InvokeCommand` property,
+which is an instance of `CommandInvocationIntrinsics` that the PowerShell engine provides
+as a kind of hook back into itself for PowerShell execution from .NET.
+
+This (and the other intrinsics APIs) have a wealth of functionality
+and provide powerful tools for surveying and manipulating the state of PowerShell.
+However, the particular methods we're interested in are the `InvokeScript()` overloads.
+
+At its simplest, `InvokeScript()` allows you to run a string as PowerShell script in the current context.
+So for example, we can define a very simple cmdlet that just executes a given string as PowerShell:
+
+```csharp
+[Cmdlet(VerbsLifecycle.Invoke, "Script")]
+public class InvokeScriptCommand : PSCmdlet
+{
+    [Parameter]
+    public string Script { get; set; }
+
+    protected override void EndProcessing()
+    {
+        WriteObject(InvokeCommand.InvokeScript(Script), enumerateCollection: true);
+    }
+}
+```
+
+```powershell
+> Invoke-Script -Script 'Get-Location'
+
+Path
+----
+C:\Users\Robert Holt\Documents\Dev\misc\psapi
+
+```
+
+Note that by default, unlike the PowerShell API, executions here occur in a new scope:
+
+```powershell
+> Invoke-Script -Script '$x = Get-Location'
+> $x
+>
+```
+
+Another overload allows you to configure this and to configure inputs and outputs,
+giving you a fair amount of flexibility on invocations.
+Note that you can set anything you don't want to use to `null`:
+
+```csharp
+[Cmdlet(VerbsLifecycle.Invoke, "Script")]
+public class InvokeScriptCommand : PSCmdlet
+{
+    [Parameter]
+    public string Script { get; set; }
+
+    protected override void EndProcessing()
+    {
+        Collection<PSObject> results = InvokeCommand.InvokeScript(
+            Script,
+            useNewScope: false,
+            // Don't use PipelineResultTypes.All here or you'll get a weird error...
+            PipelineResultTypes.Output | PipelineResultTypes.Error,
+            input: null,
+            args: new object[] { "Hello", "there" });
+
+        WriteObject(results, enumerateCollection: true);
+    }
+}
+```
+
+```powershell
+> Invoke-Script -Script '"Args[0]: $($args[0]); Args[1]: $($args[1])"'
+Args[0]: Hello; Args[1]: there
+```
+
+The other two overloads are also very interesting,
+because they take `ScriptBlock`s,
+and in particular they're useful for cmdlets that take scriptblocks as input:
+
+```csharp
+[Cmdlet(VerbsLifecycle.Invoke, "Script")]
+public class InvokeScriptCommand : PSCmdlet
+{
+    [Parameter]
+    public ScriptBlock Script { get; set; }
+
+    protected override void EndProcessing()
+    {
+        Collection<PSObject> results = InvokeCommand.InvokeScript(
+            useLocalScope: true,
+            Script,
+            input: null,
+            args: new object[] { "Hello", "there" });
+
+        WriteObject(results, enumerateCollection: true);
+    }
+}
+```
+
+```powershell
+> Invoke-Script -Script {
+>>   "Args 0: $($args[0])"
+>>   "Args 1: $($args[1])"
+>> }
+Args 0: Hello
+Args 1: there
+```
+
+### Scriptblocks and `ScriptBlock.Invoke()`
+
+This brings us neatly to talking about scriptblocks themselves,
+since they also have an `Invoke()` method.
+
+At its most basic, this means you can basically just run some script
+by creating a scriptblock around it and invoking it.
+But to do so, the thread you invoke the scriptblock on must have
+`Runspace.DefaultRunspace` created and opened:
+
+```csharp
+Runspace.DefaultRunspace = RunspaceFactory.CreateRunspace();
+Runspace.DefaultRunspace.Open();
+
+var sb = ScriptBlock.Create("Get-Location");
+
+// sb.Invoke() will throw if Runspace.DefaultRunspace is null or not open
+foreach (PSObject result in sb.Invoke())
+{
+    // Prints the current location
+    Console.WriteLine(result);
+}
+```
+
+Much more usually, `ScriptBlock.Invoke()` is something you'd call from a cmdlet or similar,
+where `Runspace.DefaultRunspace` is already instantiated:
+
+```csharp
+[Cmdlet(VerbsLifecycle.Invoke, "Script")]
+public class InvokeScriptCommand : PSCmdlet
+{
+    protected override void EndProcessing()
+    {
+        Collection<PSObject> results = ScriptBlock.Create("Get-Location").Invoke();
+
+        WriteObject(results, enumerateCollection: true);
+    }
+}
+```
+
+But these are not good ways to use `ScriptBlock`;
+scriptblocks are intended for reuse,
+and when you create a scriptblock extra work is done assuming you'll want to do that,
+compared to simply executing a string with `InvokeCommand.InvokeScript()`.
+
+Instead you should use the `ScriptBlock` type primarily when:
+
+- You're taking it as a form of input, like with a `ScriptBlock`-typed parameter
+- You want to reuse the same piece of PowerShell code repeatedly, since ScriptBlocks can cache compilation
+- You want to use the `InvokeWithContext()` method, which usually only happens with user-specified scriptblocks taken with input
+
+The `InvokeWithContext()` method is very special,
+in that it allows you to run a scriptblock in the current context,
+but with additional functions and variable added.
+This can be very handy in some niche scenarios.
+
+Let's look at a small example that combines all the reasons to use a scriptblock above:
+
+```csharp
+[Cmdlet(VerbsLifecycle.Invoke, "Script")]
+public class InvokeScriptCommand : PSCmdlet
+{
+    // We have a reusable scriptblock that defines the function 'Helper'
+    // which returns 'Hello from helper!' when invoked
+    private static readonly Dictionary<string, ScriptBlock> s_innerCommands = new Dictionary<string, ScriptBlock>
+    {
+        { "Helper", ScriptBlock.Create("'Hello from helper!'") }
+    };
+
+    [Parameter]
+    public ScriptBlock Script { get; set; }
+
+    protected override void EndProcessing()
+    {
+        // We define the variable $x, to be available in the scriptblock we invoke
+        var variables = new List<PSVariable>
+        {
+            new PSVariable("x", "CreatedVariable")
+        };
+
+        // Pass our special context in with the InvokeWithContext() method
+        Collection<PSObject> results = Script.InvokeWithContext(
+            s_innerCommands,
+            variables);
+
+        WriteObject(results, enumerateCollection: true);
+    }
+}
+```
+
+```powershell
+> Invoke-Script -Script {
+>>   Helper
+>>   $x
+>> }
+Hello from helper!
+CreatedVariable
+```
+
+With this example you can see:
+
+- We created a scriptblock we're going to reuse for the `Helper` function
+- We take in a user-supplied scriptblock for invocation
+- And, we execute that scriptblock with a custom context with the `InvokeWithContext()` overload
+- So in the user-supplied scriptblock, `Helper` and `$x` are both defined and have the values we supplied
+
 ## Runspaces, threads, async and the PowerShell API
 
 By this point, you hopefully have a fairly complete picture of using the `PowerShell` API
@@ -1510,6 +1784,109 @@ meaning that if we don't clean them up we may leak those resources until our app
 As described above, using `RunspaceMode.CurrentRunspace` can be an appropriate solution to this in certain scenarios,
 but often when you're running PowerShell from within a .NET application,
 the scenario is more complicated and so you must work harder to manage your runspace.
+This is when you need to use your own runspace.
+
+The very basic pattern for using your own runspace with a `PowerShell` object looks like this:
+
+```csharp
+var runspace = RunspaceFactory.CreateRunspace();
+runspace.Open();
+using (var powershell = PowerShell.Create())
+{
+    string greeting = powershell.AddCommand("Write-Output")
+        .AddParameter("InputObject", "Hello, World!")
+        .Invoke<string>()
+        .FirstOrDefault();
+
+    Console.WriteLine(greeting);
+}
+```
+
+However, much like the code we're running in the example above,
+this isn't very useful;
+usually you want to manually manage your runspace when its lifetime can't be contained nicely in a single method call.
+Instead, you'll likely find you want to use an encapsulating approach like this:
+
+```csharp
+class Program
+{
+    static void Main()
+    {
+        using (var psRunner = PowerShellRunner.Create())
+        {
+            var command = new PSCommand()
+                .AddCommand("Get-Date")
+
+            DateTime date = psRunner.RunPowerShell(command).First();
+
+            Console.WriteLine(date);
+        }
+    }
+}
+
+/// <summary>
+/// This class encapsulates running PowerShell commands,
+/// internally managing its own runspace so that its 
+/// </summary>
+class PowerShellRunner : IDisposable
+{
+    public static PowerShellRunner Create()
+    {
+        var runspace = RunspaceFactory.CreateRunspace();
+        runspace.Open();
+        return new PowerShellRunner(runspace);
+    }
+
+    private readonly Runspace _runspace;
+    private bool disposedValue;
+
+    protected PowerShellRunner(Runspace runspace)
+    {
+        _runspace = runspace;
+    }
+
+    public Collection<PSObject> RunPowerShell(PSCommand command)
+    {
+        using (var powershell = PowerShell.Create(_runspace))
+        {
+            powershell.Commands = command;
+            return powershell.Invoke();
+        }
+    }
+
+    public Collection<T> RunPowerShell<T>(PSCommand command)
+    {
+        using (var powershell = PowerShell.Create(_runspace))
+        {
+            Console.WriteLine($"RUNNING: {string.Join(";", command.Commands.Select(c => c.CommandText))}");
+            powershell.Commands = command;
+            Collection<T> results = powershell.Invoke<T>();
+            Console.WriteLine($"RESULTS: {string.Join(" ", results)}");
+            return results;
+        }
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (!disposedValue)
+        {
+            if (disposing)
+            {
+                _runspace.Dispose();
+            }
+
+            disposedValue = true;
+        }
+    }
+
+    public void Dispose()
+    {
+        // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
+    }
+}
+```
 
 ### Managing runspace state with `InitialSessionState`
 
@@ -1517,10 +1894,8 @@ the scenario is more complicated and so you must work harder to manage your runs
 
 ### Using the async API
 
-## Better ways to run PowerShell from cmdlets; the Intrinsics APIs
-
 ## Things to know when using threads with the PowerShell API
 
 ### Runspace creation and reuse
 
-### Cmdlet callbacks and the pipeline thread
+### The pipeline thread and its discontents

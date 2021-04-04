@@ -1,12 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Management.Automation;
-using System.Linq;
-using System.IO;
-using System.Reflection;
-using System.Management.Automation.Runspaces;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Linq;
+using System.Management.Automation;
+using System.Management.Automation.Runspaces;
+using System.Threading.Tasks;
 
 namespace psapi
 {
@@ -14,35 +13,28 @@ namespace psapi
     {
         static void Main(string[] args)
         {
-            Runspace.DefaultRunspace = RunspaceFactory.CreateRunspace();
-            Runspace.DefaultRunspace.Open();
+            // Note the big problem here:
+            // In synchronous contexts we'd use a `using` statement
+            // to dispose of PowerShell when it's done.
+            // Now we're asynchronous, we need to get smarter
+            var powershell = PowerShell.Create().AddScript("Get-Module -ListAvailable");
 
-            var parameters = new Dictionary<string, object>
-            {
-                { "x", "banana" },
-                { "y", "duck" },
-                { "z", "horsey" },
-            };
-
-            string scriptLocation = Path.GetFullPath(
-                Path.Combine(
-                    Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location),
-                    "..",
-                    "..",
-                    "..",
-                    "ex.ps1"));
-
-            using (var powershell = PowerShell.Create(RunspaceMode.CurrentRunspace))
-            {
-                IEnumerable<PSObject> results = powershell
-                    .AddCommand(scriptLocation)
-                    .AddParameters(parameters)
-                    .Invoke();
-
-                foreach (PSObject result in results)
+            Task<Collection<PSModuleInfo>> task = powershell.InvokeAsync<PSModuleInfo>(new PSDataCollection<PSModuleInfo>())
+                .ContinueWith(psTask =>
                 {
-                    Console.WriteLine(result);
-                }
+                    powershell.Dispose();
+
+                    var list = new List<PSModuleInfo>(psTask.Result.Count);
+                    foreach (PSObject result in psTask.Result)
+                    {
+                        list.Add((PSModuleInfo)result.BaseObject);
+                    }
+                    return new Collection<PSModuleInfo>(list);
+                });
+
+            foreach (PSModuleInfo module in task.GetAwaiter().GetResult())
+            {
+                Console.WriteLine(module);
             }
         }
     }

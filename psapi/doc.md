@@ -1346,6 +1346,14 @@ public class InvokeScriptCommand : PSCmdlet
 }
 ```
 
+(One thing you might notice is that scriptblocks that come from PowerShell,
+unlike those you create yourself in C#,
+actually *can* be invoked from threads where `Runspace.DefaultRunspace` isn't set.
+This is because scriptblocks created in PowerShell have runspace-affinity;
+when invoked from another thread,
+an engine-created scriptblock will generate an event for its execution
+and then wait on that event to be processed by the thread hosting the runspace.)
+
 But these are not good ways to use `ScriptBlock`;
 scriptblocks are intended for reuse,
 and when you create a scriptblock extra work is done assuming you'll want to do that,
@@ -1775,7 +1783,8 @@ and that PowerShell object is tracked as *owning* that runspace,
 so that when it's disposed at the end of the `using` block, the runspace is also disposed of properly.
 
 However, when runspaces are not associated with a `PowerShell` object through `RunspaceMode.NewRunspace`,
-*we* are responsible for cleaning it up.
+*we* are responsible for cleaning it up
+(unless we're reusing an already existant `Runspace.DefaultRunspace`, like on the pipeline thread).
 This is important because runspaces really represent most of the overhead of executing PowerShell;
 because they're the sandbox in which PowerShell executes,
 they represent all the memory and caches and context,
@@ -1826,7 +1835,7 @@ class Program
 
 /// <summary>
 /// This class encapsulates running PowerShell commands,
-/// internally managing its own runspace so that its 
+/// internally managing details such as runspaces and PowerShell instance lifetimes.
 /// </summary>
 class PowerShellRunner : IDisposable
 {
@@ -1881,7 +1890,6 @@ class PowerShellRunner : IDisposable
 
     public void Dispose()
     {
-        // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
         Dispose(disposing: true);
         GC.SuppressFinalize(this);
     }
@@ -1890,9 +1898,425 @@ class PowerShellRunner : IDisposable
 
 ### Managing runspace state with `InitialSessionState`
 
+As a quick aside here, you might notice that there is a `PowerShell.Create()` overload that takes an `InitialSessionState`,
+just as there are for `RunspaceFactory.CreateRunspace()` and `RunspaceFactory.CreateRunspacePool()`.
+An `InitialSessionState` is essentially a blueprint for a session or runspace,
+which you can use to provide some initial state for the runspace executing your PowerShell invocation.
+
+We won't go into detail here about the `InitialSessionState` concept (and all the ways to construct and use one),
+but instead mention the possibility of using one to give you fine-grained control over what's defined in your runspace.
+
+The reason this is relevant in the context of the PowerShell API is
+that there are several key scenarios for using an `InitialSessionState` in conjunction with the PowerShell API:
+
+- Using an `InitialSessionState` with `RunspaceFactory.CreateRunspacePool()` allows you to create several runspaces all with the same initial state,
+  for example all with the same set of modules loaded.
+  This can be convenient for parallelism that requires some kind of one-time setup.
+- If you're using a `PowerShell` instance to run user-provided input,
+  an `InitialSessionState` can be used to limit what commands and functionalities are available.
+  In particular see `InitialSessionState.CreateRestricted()`.
+- If you only wish to run a small set of commands and performance is an issue,
+  you can use an `InitialSessionState` to specify only what you need to run your slimmed down session,
+  to reduce the overhead of loading the default PowerShell context.
+
 ### Fanning out with a `RunspacePool`
 
+So far, we've only looked at running PowerShell invocations one at a time
+and in a single runspace (explicitly or implicitly).
+
+However, when you're using the `PowerShell` API,
+and especially if you're doing something like writing a .NET application that runs PowerShell,
+you often encounter the need to run multiple PowerShell invocations concurrently.
+
+To begin with, let's look at just running some simple concurrent commands.
+We're going to fire off some `Get-Random` calls in parallel with a runspace pool:
+
+```csharp
+var runspacePool = RunspaceFactory.CreateRunspacePool(1, 10);
+runspacePool.Open();
+
+var results = new int[10];
+Parallel.For(0, results.Length, (i) =>
+{
+    // Note we create a new PowerShell instance per thread
+    // rather than using the same instance across them
+    using (var powershell = PowerShell.Create())
+    {
+        // The magic happens here where our local instance is told to use the runspace pool
+        powershell.RunspacePool = runspacePool;
+
+        results[i] = powershell.AddCommand("Get-Random").Invoke<int>().First();
+    }
+});
+
+Console.WriteLine(string.Join(", ", results));
+```
+
+You can see in this example, the runspace pool handles the concurrent calls quite transparently;
+all we had to do was to tell our `PowerShell` instance to use a runspace pool
+and everything just worked.
+
+In a real situation, of course, we probably don't know how many threads we'll have
+and things won't be neatly contained all in one method like they are here.
+Let's instead update our encapsulation class that we wrote earlier to use a runspace pool
+to buy us more parallelism (but in a bounded way, so we don't start leaking runspaces).
+
+```csharp
+/// <summary>
+/// This class encapsulates running PowerShell commands,
+/// internally managing details such as runspaces and PowerShell instance lifetimes.
+/// This version uses a runspace pool to provide parallelization of execution calls.
+/// </summary>
+class PowerShellParallelRunner : IDisposable
+{
+    public static PowerShellRunner Create(int maxRunspaces)
+    {
+        var runspacePool = RunspaceFactory.CreateRunspacePool(1, maxRunspaces);
+        runspacePool.Open();
+        return new PowerShellRunner(runspacePool);
+    }
+
+    private readonly RunspacePool _runspacePool;
+    private bool disposedValue;
+
+    protected PowerShellRunner(RunspacePool runspacePool)
+    {
+        _runspacePool = runspacePool;
+    }
+
+    public Collection<PSObject> RunPowerShell(PSCommand command)
+    {
+        using (var powershell = PowerShell.Create())
+        {
+            powershell.RunspacePool = _runspacePool;
+
+            powershell.Commands = command;
+            return powershell.Invoke();
+        }
+    }
+
+    public Collection<T> RunPowerShell<T>(PSCommand command)
+    {
+        using (var powershell = PowerShell.Create())
+        {
+            powershell.RunspacePool = _runspacePool;
+            powershell.Commands = command;
+            Collection<T> results = powershell.Invoke<T>();
+            return results;
+        }
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (!disposedValue)
+        {
+            if (disposing)
+            {
+                _runspacePool.Dispose();
+            }
+
+            disposedValue = true;
+        }
+    }
+
+    public void Dispose()
+    {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
+    }
+}
+```
+
+You can see here that we've changed almost nothing.
+Essentially, rather than creating `PowerShell` instances around a runspace object,
+instead we just assign the same instances our runspace pool instead.
+But unlike the toy example above,
+this object is a threadsafe encapsulation of PowerShell execution
+that you can safely use in any application that needs to call PowerShell from time to time.
+
+One important thing to note here is that the runspace pool is just a pool of runspaces
+and runspaces are stateful.
+That means that executions that depend on runspace state can't be relied upon
+to have the same result every time when used with a runspace pool.
+For example, if you're running different commands through your runspace pool
+and then run `Get-Module`,
+the result may vary depending on which runspace it was run on;
+some runspaces may have loaded different modules depending on the commands preceding it.
+So when using a runspace pool, it's important to ensure that either
+(1) your results don't depend on runspace state,
+or (2) your state-dependent commands idempotently put the runspace they execute on into some well-defined state
+(for example, calling `Remove-Module` before a `Get-Module` call).
+
 ### Using the async API
+
+The PowerShell executor we created above works well,
+but it suffers from a big issue,
+especially for an application that's servicing other tasks.
+The problem is that any callers to `RunPowerShell()` are going to be blocked waiting for PowerShell to execute.
+
+Instead we can try to make this asynchronous,
+so that callers can use `async`/`await` (or other methods) to free up their calling thread while waiting for PowerShell results.
+
+Let's begin with a simple example:
+
+```csharp
+void Execute()
+{
+    var command = new PSCommand().AddCommand("Get-Module").AddParameter("ListAvailable");
+
+    foreach (PSModuleInfo module in RunPowerShell<PSModuleInfo>(command))
+    {
+        Console.WriteLine(module);
+    }
+}
+
+Collection<T> RunPowerShell<T>(PSCommand command)
+{
+    using (var powershell = PowerShell.Create())
+    {
+        powershell.Commands = command;
+        return powershell.Invoke<T>();
+    }
+}
+```
+
+Because `Get-Module -ListAvailable` is a long running command,
+`Execute()` is going to be blocked waiting for it.
+Instead we'd prefer to be asynchronous.
+A naive approach looks like this:
+
+```csharp
+async Task ExecuteAsync()
+{
+    var command = new PSCommand().AddCommand("Get-Module").AddParameter("ListAvailable");
+
+    foreach (PSModuleInfo module in await RunPowerShellAsync<PSModuleInfo>(command))
+    {
+        Console.WriteLine(module);
+    }
+}
+
+Task<Collection<T>> RunPowerShellAsync<T>(PSCommand command)
+{
+    return Task.Run(() =>
+    {
+        using (var powershell = PowerShell.Create())
+        {
+            powershell.Commands = command;
+            return powershell.Invoke<T>();
+        }
+    }
+}
+```
+
+All we've done here is wrapped our `RunPowerShell()` body in `Task.Run()` to push it out to another thread.
+This will work from the perspective of `ExecuteAsync()`;
+it's now possible to write as an `async` method that can asynchronously `await` the PowerShell execution.
+But we've just booted the blocking wait out to the task threadpool
+&dash; all we did here was put a synchronous call inside a new thread whose job it is to wait for that call to complete.
+
+Ultimately PowerShell execution is synchronous, so some thread somewhere is going to have to do this work,
+but it's usually a good idea to allow that to happen at the lowest level possible
+(in case there are asynchronous efficiencies the call can find below our level).
+It turns out the `PowerShell` object offers some async-aware APIs
+so maybe we can just reuse those.
+
+The traditional (Asynchronous Programming Model or APM) option is to use the `BeginInvoke()` and `EndInvoke()` methods.
+If you're using Windows PowerShell 5.1, this is the only asynchronous PowerShell API available,
+so it's helpful to know how to integrated this nicely with the modern Task-based Asynchronous Pattern (TAP).
+We ultimately want to end up with some kind of `Task` as output here,
+so we can follow [.NET's handy migration guide](https://docs.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/interop-with-other-asynchronous-patterns-and-types)
+to hook up these methods to a a `Task` implementation:
+
+```csharp
+async Task ExecuteAsync()
+{
+    var command = new PSCommand().AddCommand("Get-Module").AddParameter("ListAvailable");
+
+    foreach (PSModuleInfo module in await RunPowerShellAsync<PSModuleInfo>(command))
+    {
+        Console.WriteLine(module);
+    }
+}
+
+Task<Collection<T>> RunPowerShellAsync<T>(PSCommand command)
+{
+    // Note the big problem here:
+    // In synchronous contexts we'd use a `using` statement
+    // to dispose of PowerShell when it's done.
+    // Now we're asynchronous, we need to get smarter
+    var powershell = PowerShell.Create();
+
+    powershell.Commands = command;
+
+    // Task.Factory.FromAsync is .NET's helpful method for converting APM APIs to TAP ones
+    //
+    // Note that we're forced to use PSDataCollection<PSObject> rather than PSDataCollection<T>
+    // because PowerShell.EndInvoke() does not have a generic form.
+    return Task<PSDataCollection<PSObject>>.Factory.FromAsync(
+        (callback, state) => powershell.BeginInvoke(
+            new PSDataCollection<PSObject>(),
+            new PSInvocationSettings(), // We have to provide invocation settings for this override, but the default value works as we expect
+            callback,
+            state),
+        powershell.EndInvoke,
+        state: null)
+        .ContinueWith(psTask =>
+        {
+            // Here's where we dispose of PowerShell
+            // ContinueWith() is called after the invocation is done (and whether it failed or not),
+            // so this is the right place to dispose of the PowerShell instance
+            powershell.Dispose();
+
+            // Because of the lack of an EndInvoke() generic above,
+            // we have to manually transfer our results to a new, strongly-typed collection
+            var results = new List<T>(psTask.Result.Count);
+            foreach (PSObject result in psTask.Result)
+            {
+                results.Add((T)result.BaseObject);
+            }
+            return new Collection<T>(results);
+        });
+}
+```
+
+This is a bit of a handful, but you can see that mostly the hard part is done by .NET for us.
+Of course, it would be nicer if `PowerShell` just provided an `InvokeAsync()` method,
+and in PowerShell 7, it does:
+
+```csharp
+Task<Collection<T>> RunPowerShellAsync<T>(PSCommand command)
+{
+    // We still have the disposal problem, which we'll solve again in much the same way
+    var powershell = PowerShell.Create();
+
+    powershell.Commands = command;
+
+    return powershell.InvokeAsync<T>(new PSDataCollection<T>())
+        .ContinueWith(psTask =>
+        {
+            // Dispose of PowerShell after execution
+            powershell.Dispose();
+
+            // Note we also have to perform the conversion manually
+            var list = new List<T>(psTask.Result.Count);
+            foreach (PSObject result in psTask.Result)
+            {
+                list.Add((T)result.BaseObject);
+            }
+            return new Collection<T>(list);
+        });
+}
+```
+
+This method is a little bit clunky, as you can see,
+but it certainly simplifies things.
+
+So with this knowledge, we can now update our `PowerShellParallelRunner` class to provide an asynchronous API:
+
+```csharp
+/// <summary>
+/// This class encapsulates running PowerShell commands,
+/// internally managing details such as runspaces and PowerShell instance lifetimes.
+/// This version uses a runspace pool to provide parallelization of execution calls.
+/// </summary>
+class PowerShellParallelRunner : IDisposable
+{
+    public static PowerShellRunner Create(int maxRunspaces)
+    {
+        var runspacePool = RunspaceFactory.CreateRunspacePool(1, maxRunspaces);
+        runspacePool.Open();
+        return new PowerShellRunner(runspacePool);
+    }
+
+    private readonly RunspacePool _runspacePool;
+    private bool disposedValue;
+
+    protected PowerShellRunner(RunspacePool runspacePool)
+    {
+        _runspacePool = runspacePool;
+    }
+
+    public Collection<PSObject> RunPowerShell(PSCommand command)
+    {
+        using (var powershell = PowerShell.Create())
+        {
+            powershell.RunspacePool = _runspacePool;
+            powershell.Commands = command;
+            return powershell.Invoke();
+        }
+    }
+
+    public Collection<T> RunPowerShell<T>(PSCommand command)
+    {
+        using (var powershell = PowerShell.Create())
+        {
+            powershell.RunspacePool = _runspacePool;
+            powershell.Commands = command;
+            return powershell.Invoke<T>();
+        }
+    }
+
+    public Task<Collection<PSObject>> RunPowerShellAsync(PSCommand command)
+    {
+        var powershell = PowerShell.Create();
+        powershell.RunspacePool = _runspacePool;
+        powershell.Commands = command;
+
+        return powershell.InvokeAsync(new PSDataCollection<PSObject>())
+            .ContinueWith(psTask =>
+            {
+                powershell.Dispose();
+
+                var results = new List<PSObject>(psTask.Result.Count);
+                foreach (PSObject result in psTask.Result)
+                {
+                    results.Add(result);
+                }
+                return new Collection<PSObject>(results);
+            });
+    }
+
+    public Task<Collection<T>> RunPowerShellAsync<T>(PSCommand command)
+    {
+        var powershell = PowerShell.Create();
+        powershell.RunspacePool = _runspacePool;
+        powershell.Commands = command;
+
+        return powershell.InvokeAsync<T>(new PSDataCollection<T>())
+            .ContinueWith(psTask =>
+            {
+                powershell.Dispose();
+
+                var results = new List<T>(psTask.Result.Count);
+                foreach (PSObject result in psTask.Result)
+                {
+                    results.Add((T)result.BaseObject);
+                }
+                return new Collection<T>(results);
+            });
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (!disposedValue)
+        {
+            if (disposing)
+            {
+                _runspacePool.Dispose();
+            }
+
+            disposedValue = true;
+        }
+    }
+
+    public void Dispose()
+    {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
+    }
+}
+```
 
 ## Things to know when using threads with the PowerShell API
 

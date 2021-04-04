@@ -1200,7 +1200,7 @@ and are intended to be used in the implementation of a cmdlet or provider.
 
 ### The `InvokeCommand` property, or `CommandInvocationIntrinsics`
 
-Cmdlets inheriting from `PSCmdlet` and providers all have an `InvokeCommand` property,
+Cmdlets inheriting from `PSCmdlet` and PowerShell providers (inheriting from `CmdletProvider`) all have an `InvokeCommand` property,
 which is an instance of `CommandInvocationIntrinsics` that the PowerShell engine provides
 as a kind of hook back into itself for PowerShell execution from .NET.
 
@@ -2318,8 +2318,81 @@ class PowerShellParallelRunner : IDisposable
 }
 ```
 
+### Using `PowerShell.Stop()` to abort PowerShell execution
+
 ## Things to know when using threads with the PowerShell API
 
-### Runspace creation and reuse
+After expounding on all the possibilities of calling PowerShell on threads above,
+there are some caveats and limitations that it's important to keep in mind.
 
-### The pipeline thread and its discontents
+We've alluded to them somewhat so far,
+but it's worth being explicit about them
+in their own section.
+
+### Using runspaces
+
+The first important thing to be mindful of when using PowerShell across threads is runspaces.
+
+There are several points to be aware of here.
+
+#### Runspace state
+
+An important concept to always keep in mind, especially if you're using a runspace pool,
+is that PowerShell runspaces are stateful.
+
+When you import modules or define variables,
+you change the state of a runspace,
+meaning the same script across that runspace and another may have different results.
+
+When running commands against a runspace,
+you should ensure that any part of that runspace's state
+either doesn't affect your command or is well-defined before that command is run
+(i.e. you know what that state will be, rather than it being ambiguous because some previous command might have changed it).
+
+#### Runspace leakage and disposal
+
+If you're manually creating runspaces,
+one thing to be careful of is that you're disposing of them properly.
+
+Runspaces are quite heavyweight objects because they store a lot of context.
+Creating and opening them can be resource intensive,
+and if not managed properly,
+leaking runspaces can quickly consume a lot of memory.
+For this reason, a runspace pool is often a good idea
+to limit your application's footprint.
+
+More than this, runspaces are essentially public in PowerShell;
+`Get-Runspace` will show all runspaces available in the current PowerShell process
+from any runspace.
+So creating runspaces without properly disposing of them will pollute this list.
+
+Remember that because this global list exists,
+it's not enough to simply set a runspace reference to `null`.
+You must always call the `.Dispose()` method.
+
+#### Environment variables and PSModulePath
+
+Because environment variables are process wide (by operating system design),
+and a process hosting PowerShell can have multiple runspaces,
+environment variables are effectively global variables shared across runspaces.
+
+This means that environment variables are effectively volatile,
+and any multi-runspace scenario that manipulates environment variables
+must be very careful to ensure that race conditions around environment variables don't cause issues.
+
+Related to this is the current behavior in PowerShell where opening a new runspace
+[may change the PSModulePath](https://github.com/PowerShell/PowerShell/issues/9921).
+This includes implicit runspace opens, like when `Invoke()` is called on an object created with `PowerShell.Create()`.
+This behavior can cause significant issues if your application depends on being able to manipulate the PSModulePath,
+so the recommended solution is to ensure you save and reset the PSModulePath whenever you do something that might open a runspace.
+
+### The pipeline thread
+
+The other big concept to keep in mind when writing PowerShell around threads
+is the concept of the pipeline thread.
+This is something that we've referred to in places above,
+but not fully explained.
+
+PowerShell is effectively single-threaded in terms of its behavior;
+it doesn't have a way to easily spin-up a new in-process thread
+with which memory is shared.

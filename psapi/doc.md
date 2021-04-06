@@ -1352,7 +1352,7 @@ actually *can* be invoked from threads where `Runspace.DefaultRunspace` isn't se
 This is because scriptblocks created in PowerShell have runspace-affinity;
 when invoked from another thread,
 an engine-created scriptblock will generate an event for its execution
-and then wait on that event to be processed by the thread hosting the runspace.)
+and then wait on that event to be processed by the thread hosting its original runspace.)
 
 But these are not good ways to use `ScriptBlock`;
 scriptblocks are intended for reuse,
@@ -1932,7 +1932,7 @@ To begin with, let's look at just running some simple concurrent commands.
 We're going to fire off some `Get-Random` calls in parallel with a runspace pool:
 
 ```csharp
-var runspacePool = RunspaceFactory.CreateRunspacePool(1, 10);
+var runspacePool = RunspaceFactory.CreateRunspacePool(minRunspaces: 1, maxRunspaces: 10);
 runspacePool.Open();
 
 var results = new int[10];
@@ -1971,7 +1971,7 @@ class PowerShellParallelRunner : IDisposable
 {
     public static PowerShellRunner Create(int maxRunspaces)
     {
-        var runspacePool = RunspaceFactory.CreateRunspacePool(1, maxRunspaces);
+        var runspacePool = RunspaceFactory.CreateRunspacePool(minRunspaces: 1, maxRunspaces);
         runspacePool.Open();
         return new PowerShellRunner(runspacePool);
     }
@@ -2182,7 +2182,7 @@ Task<Collection<T>> RunPowerShellAsync<T>(PSCommand command)
 
 This is a bit of a handful, but you can see that mostly the hard part is done by .NET for us.
 Of course, it would be nicer if `PowerShell` just provided an `InvokeAsync()` method,
-and in PowerShell 7, it does:
+and in PowerShell 7 it does:
 
 ```csharp
 Task<Collection<T>> RunPowerShellAsync<T>(PSCommand command)
@@ -2224,7 +2224,7 @@ class PowerShellParallelRunner : IDisposable
 {
     public static PowerShellRunner Create(int maxRunspaces)
     {
-        var runspacePool = RunspaceFactory.CreateRunspacePool(1, maxRunspaces);
+        var runspacePool = RunspaceFactory.CreateRunspacePool(minRunspaces: 1, maxRunspaces);
         runspacePool.Open();
         return new PowerShellRunner(runspacePool);
     }
@@ -2326,7 +2326,7 @@ from the one running the command,
 we also confront the possibility that the triggering thread may want to stop the triggered execution.
 
 This is something you're probably actually quite used to in a specific way;
-calling `Ctrl`+`C` to cancel a running command in the console
+calling `Ctrl+C` to cancel a running command in the console
 will stop a running pipeline and restore the PowerShell prompt.
 
 In order to serve such scenarios, the `PowerShell` API also provides a hook for this:
@@ -2363,7 +2363,7 @@ When this is run, we get something like this:
 3
 ```
 
-The important part here is that we actually get a partial result.
+An interesting point to note is that we actually get a partial result.
 Even though we stopped PowerShell, we get to keep all the output we got so far.
 
 There is an important caveat here, which is that the `Stop()` method will only stop the currently running *command*,
@@ -2464,7 +2464,7 @@ class PowerShellScriptRunner
 {
     public static PowerShellScriptRunner Create(int maxRunspaces)
     {
-        RunspacePool runspacePool = RunspaceFactory.CreateRunspacePool(1, maxRunspaces);
+        RunspacePool runspacePool = RunspaceFactory.CreateRunspacePool(minRunspaces: 1, maxRunspaces);
         return new PowerShellScriptRunner(runspacePool);
     }
 
@@ -2497,13 +2497,12 @@ class PowerShellScriptRunner
 You can see here that the `PowerShell.Stop()` API is fairly easy to integrate with the standard C# TAP/async pattern.
 This class is quite a neat illustration of how the PowerShell API serves a fairly advanced scenario
 &mdash; a concurrent, pooled, asynchronous script runner class with cancellation support &mdash;
-with quite a lot of configurability without laboring you with too much boilerplate.
+providing you with quite a lot of configurability without the encumberance of lots of boilerplate.
 
 ## Things to know when using threads with the PowerShell API
 
 After expounding on all the possibilities of calling PowerShell on threads above,
 there are some caveats and limitations that it's important to keep in mind.
-
 We've alluded to them somewhat so far,
 but it's worth being explicit about them
 in their own section.
@@ -2511,7 +2510,6 @@ in their own section.
 ### Using runspaces
 
 The first important thing to be mindful of when using PowerShell across threads is runspaces.
-
 There are several points to be aware of here.
 
 #### Runspace state
@@ -2591,7 +2589,7 @@ but it's always good to be mindful of the pipeline thread when writing .NET arou
 The other side of this is that the pipeline thread is also the worker thread for PowerShell,
 so time you spend using it is time that other executions can't be run on it.
 If you have an application where you're running PowerShell but need more performance,
-the best design is generally to do only what you must on the pipeline thread
+the best approach is generally to do only what you must on the pipeline thread
 (i.e. the calls and transformations that can only be safely done on the pipeline thread)
 and then process the now-safe result elsewhere.
 
@@ -2600,7 +2598,8 @@ Some particular scenarios to look out for:
 - Many of PowerShell's `Info` objects, like `AliasInfo` for example, are lazily instantiated on the pipeline thread.
   To make them safe to use off the pipeline thread, it's often worth doing something
   like converting them to a fully instantiated object (e.g. transform them to a type you own, copying all the data).
-- Events and event handlers usually occur between threads, so be wary of what thread events are handled on
+- Events and event handlers usually occur between threads, so if passing data from an event to an event handler or vice-versa,
+  always be wary that the thread that handles an event likely differs from the one that created or owns the data.
 - `async`/`await` in C#, which is particularly diabolical since `async` methods may be run on a series of threadpool threads by design.
 
 The last case can arise particularly when writing cmdlets,
@@ -2633,7 +2632,7 @@ When this is executed, we get the following error:
 Invoke-Example: The WriteObject and WriteError methods cannot be called from outside the overrides of the BeginProcessing, ProcessRecord, and EndProcessing methods, and they can only be called from within the same thread. Validate that the cmdlet makes these calls correctly, or contact Microsoft Customer Support Services.
 ```
 
-This is because C#'s `async` feature has quietly kicked the `DoWork()` execution into the task thread pool,
+This is because C#'s `async` feature has quietly kicked the `DoWorkAsync()` execution into the task thread pool,
 so `WriteVerbose()` is not called on the pipeline thread.
 The assumptions that we might usually have made about ordinary C# code
 (particularly that we don't need to care what thread a method is called from in an `async` method),
@@ -2684,6 +2683,7 @@ public class InvokeExampleCommand : PSCmdlet
     {
         // Kick off the work we need to do
         Task workTask = DoWorkAsync();
+
         // While we wait, service the task
         // You might like to implement this as an extension method: DoWorkAsync().AwaitAndRunCallbacks()
         AwaitTasksAndRunCallbacks(workTask);

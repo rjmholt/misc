@@ -2263,7 +2263,7 @@ class PowerShellParallelRunner : IDisposable
         powershell.RunspacePool = _runspacePool;
         powershell.Commands = command;
 
-        return powershell.InvokeAsync(new PSDataCollection<PSObject>())
+        return powershell.InvokeAsync()
             .ContinueWith(psTask =>
             {
                 powershell.Dispose();
@@ -2319,6 +2319,185 @@ class PowerShellParallelRunner : IDisposable
 ```
 
 ### Using `PowerShell.Stop()` to abort PowerShell execution
+
+To this point, everything that we've covered has been about running PowerShell in some way.
+But as we introduce the concept of threads and decouple our triggering thread
+from the one running the command,
+we also confront the possibility that the triggering thread may want to stop the triggered execution.
+
+This is something you're probably actually quite used to in a specific way;
+calling `Ctrl`+`C` to cancel a running command in the console
+will stop a running pipeline and restore the PowerShell prompt.
+
+In order to serve such scenarios, the `PowerShell` API also provides a hook for this:
+the `PowerShell.Stop()` method.
+
+First here's a small example where we start a PowerShell execution and then stop it before it's run its course:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    // Start running PowerShell
+    Task<Collection<int>> psTask = Task.Run(() => powershell.AddScript("1;2;3;Start-Sleep 10;4;5;6").Invoke<int>());
+
+    // Wait two seconds
+    Thread.Sleep(2000);
+
+    // Stop PowerShell running
+    powershell.Stop();
+
+    // Because this is inherently a race condition, we have no guarantee of what will be printed.
+    // But printing a number beyond 4 is pretty unlikely
+    foreach (int result in psTask.GetAwaiter().GetResult())
+    {
+        Console.WriteLine(result);
+    }
+}
+```
+
+When this is run, we get something like this:
+
+```output
+1
+2
+3
+```
+
+The important part here is that we actually get a partial result.
+Even though we stopped PowerShell, we get to keep all the output we got so far.
+
+There is an important caveat here, which is that the `Stop()` method will only stop the currently running *command*,
+not the whole invocation.
+Note that the [documentation](https://docs.microsoft.com/en-us/dotnet/api/system.management.automation.powershell.stop)
+of `Stop()` says exactly this.
+When you use `AddScript()`, this is treated as an atomic command and `Stop()` interrupts it midway.
+But if we try to break the script up into separate statements, we get a different behavior:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    // Start running PowerShell
+    Task<Collection<int>> psTask = Task.Run(() => {
+        return powershell
+            .AddCommand("Write-Output")
+                .AddParameter(new int[] { 1, 2, 3 })
+            .AddStatement()
+            .AddCommand("Start-Sleep")
+                .AddParameter("Seconds", 10)
+            .AddStatement()
+            .AddCommand("Write-Output")
+                .AddParameter(new int[] { 1, 2, 3 })
+            .Invoke<int>();
+    });
+
+    // Wait two seconds
+    Thread.Sleep(2000);
+
+    // Stop PowerShell running the current command
+    powershell.Stop();
+
+    // Because this is inherently a race condition, we have no guarantee of what will be printed.
+    // But printing a number beyond 4 is pretty unlikely
+    foreach (int result in psTask.GetAwaiter().GetResult())
+    {
+        Console.WriteLine(result);
+    }
+}
+```
+
+We now get the output:
+
+```output
+1
+2
+3
+4
+5
+6
+```
+
+Moreover, running this to experiment with the example this took 6 seconds,
+considerably less than the 10 we configured the script to sleep for.
+
+So what's happening?
+The `Stop()` call cancels the `Start-Sleep` command, but then invocation resumes at the next statement.
+This is the intended behaviour, but something worth keeping in mind.
+
+Looking at the asynchronous PowerShell API, you'll notice the behavior is different again.
+Let's reuse our example again to take a quick look:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    Task<PSDataCollection<PSObject>> psTask = powershell.AddScript("1;2;3;Start-Sleep 10;4;5;6").InvokeAsync();
+
+    Thread.Sleep(2000);
+
+    powershell.Stop();
+
+    foreach (PSObject result in psTask.GetAwaiter().GetResult())
+    {
+        Console.WriteLine(result);
+    }
+}
+```
+
+This time we actually get an exception:
+
+```output
+Unhandled exception. System.Management.Automation.PipelineStoppedException: The pipeline has been stopped.
+   at System.Management.Automation.Runspaces.AsyncResult.EndInvoke()
+   at System.Management.Automation.PowerShell.EndInvoke(IAsyncResult asyncResult)
+   at System.Threading.Tasks.TaskFactory`1.FromAsyncCoreLogic(IAsyncResult iar, Func`2 endFunction, Action`1 endAction, Task`1 promise, Boolean requiresSynchronization)
+--- End of stack trace from previous location ---
+   at psapi.Program.Main(String[] args) in C:\Users\me\psapi\Program.cs:line 25
+```
+
+This is something of a limitation of the asynchronous API, but worth being aware of.
+The standard trick in situations like this is to pass in a `PSDataCollection<PSObject>` to collect any output,
+however behavior with this can vary.
+
+But now let's create a more practical example: an asynchronous runner object that can execute scripts but allow cancelling them too:
+
+```csharp
+class PowerShellScriptRunner
+{
+    public static PowerShellScriptRunner Create(int maxRunspaces)
+    {
+        RunspacePool runspacePool = RunspaceFactory.CreateRunspacePool(1, maxRunspaces);
+        return new PowerShellScriptRunner(runspacePool);
+    }
+
+    private readonly RunspacePool _runspacePool;
+
+    protected PowerShellScriptRunner(RunspacePool runspacePool)
+    {
+        _runspacePool = runspacePool;
+    }
+
+    public Task<PSObject> RunScriptAsync(string script, CancellationToken cancellationToken)
+    {
+        // We're using the Task.Run() + synchronous invocation here since Stop() works nicely with it
+        return Task.Run(() =>
+        {
+            using (var powershell = PowerShell.Create())
+            {
+                powershell.RunspacePool = _runspacePool;
+
+                // We can hook up the cancellation token to trigger the PowerShell.Stop() call quite easily like this
+                cancellationToken.Register(() => powershell.Stop());
+
+                return powershell.AddScript(script).Invoke();
+            }
+        });
+    }
+}
+```
+
+You can see here that the `PowerShell.Stop()` API is fairly easy to integrate with the standard C# TAP/async pattern.
+This class is quite a neat illustration of how the PowerShell API serves a fairly advanced scenario
+&mdash; a concurrent, pooled, asynchronous script runner class with cancellation support &mdash;
+with quite a lot of configurability without laboring you with too much boilerplate.
 
 ## Things to know when using threads with the PowerShell API
 
@@ -2396,3 +2575,284 @@ but not fully explained.
 PowerShell is effectively single-threaded in terms of its behavior;
 it doesn't have a way to easily spin-up a new in-process thread
 with which memory is shared.
+It's possible to spin up multiple runspaces, each with their own thread of execution,
+but they're not designed to easily communicate between each other.
+
+When we write .NET programs around or under PowerShell,
+we tend to forget that .NET has well defined behavior in scenarios where execution changes threads,
+while PowerShell may well not,
+and this is often the cause of subtle bugs.
+A lot of methods and properties on objects that come from within PowerShell
+assume they will be called on the pipeline thread,
+so when this assumption is violated by our .NET program all kinds of things can happen.
+This more often applies to code written inside cmdlets than when using the PowerShell API,
+but it's always good to be mindful of the pipeline thread when writing .NET around PowerShell.
+
+The other side of this is that the pipeline thread is also the worker thread for PowerShell,
+so time you spend using it is time that other executions can't be run on it.
+If you have an application where you're running PowerShell but need more performance,
+the best design is generally to do only what you must on the pipeline thread
+(i.e. the calls and transformations that can only be safely done on the pipeline thread)
+and then process the now-safe result elsewhere.
+
+Some particular scenarios to look out for:
+
+- Many of PowerShell's `Info` objects, like `AliasInfo` for example, are lazily instantiated on the pipeline thread.
+  To make them safe to use off the pipeline thread, it's often worth doing something
+  like converting them to a fully instantiated object (e.g. transform them to a type you own, copying all the data).
+- Events and event handlers usually occur between threads, so be wary of what thread events are handled on
+- `async`/`await` in C#, which is particularly diabolical since `async` methods may be run on a series of threadpool threads by design.
+
+The last case can arise particularly when writing cmdlets,
+because `PSCmdlet` properties and methods must be called from the pipeline thread.
+For example, let's look at the following cmdlet,
+intended to simulate a read cmdlet that tries to concurrently do something asynchronously:
+
+```csharp
+[Cmdlet(VerbsLifecycle.Invoke, "Example")]
+public class InvokeExampleCommand : PSCmdlet
+{
+    protected override void EndProcessing()
+    {
+        Task workTask = DoWorkAsync();
+        WriteObject("Other work done on the pipeline thread");
+        workTask.GetAwaiter().GetResult();
+    }
+
+    private async Task DoWorkAsync()
+    {
+        await Task.Delay(1000);
+        WriteVerbose("Work done!");
+    }
+}
+```
+
+When this is executed, we get the following error:
+
+```output
+Invoke-Example: The WriteObject and WriteError methods cannot be called from outside the overrides of the BeginProcessing, ProcessRecord, and EndProcessing methods, and they can only be called from within the same thread. Validate that the cmdlet makes these calls correctly, or contact Microsoft Customer Support Services.
+```
+
+This is because C#'s `async` feature has quietly kicked the `DoWork()` execution into the task thread pool,
+so `WriteVerbose()` is not called on the pipeline thread.
+The assumptions that we might usually have made about ordinary C# code
+(particularly that we don't need to care what thread a method is called from in an `async` method),
+are not valid for our interaction with PowerShell here.
+
+Instead, in a case like this we need to come up with a solution that means we'll only ever call `WriteVerbose()` from the pipeline thread.
+One possibility is to just keep the async work and the cmdlet calls separate:
+
+```csharp
+[Cmdlet(VerbsLifecycle.Invoke, "Example")]
+public class InvokeExampleCommand : PSCmdlet
+{
+    protected override void EndProcessing()
+    {
+        Task workTask = DoWorkAsync();
+        WriteObject("Other work done on the pipeline thread");
+        workTask.GetAwaiter().GetResult();
+        WriteVerbose("Work done!");
+    }
+
+    private async Task DoWorkAsync()
+    {
+        await Task.Delay(1000);
+    }
+}
+```
+
+There are ways to develop more concurrent solutions,
+but they are quite involved,
+since we must ensure the pipeline thread is still always where the needed method is called.
+In the following example, we implement a callback queue on the pipeline thread
+allowing async calls to call back to cmdlet APIs:
+
+```csharp
+[Cmdlet(VerbsLifecycle.Invoke, "Example")]
+public class InvokeExampleCommand : PSCmdlet
+{
+    private readonly ConcurrentQueue<(Action, TaskCompletionSource)> _callbacks;
+    private readonly BlockingCollection<(Action, TaskCompletionSource)> _callbackQueue;
+
+    public InvokeExampleCommand()
+    {
+        _callbacks = new ConcurrentQueue<(Action, TaskCompletionSource)>();
+        _callbackQueue = new BlockingCollection<(Action, TaskCompletionSource)>(_callbacks);
+    }
+
+    protected override void EndProcessing()
+    {
+        // Kick off the work we need to do
+        Task workTask = DoWorkAsync();
+        // While we wait, service the task
+        // You might like to implement this as an extension method: DoWorkAsync().AwaitAndRunCallbacks()
+        AwaitTasksAndRunCallbacks(workTask);
+    }
+
+    private async Task DoWorkAsync()
+    {
+        await Task.Delay(1000);
+
+        // WriteVerbose is now async-ified
+        // Note that we should await it so we don't race the callback loop
+        await WriteVerboseAsync("Work done!");
+    }
+
+    // Create a new method that lets us call back to the pipeline thread and wait for the result
+    private Task WriteVerboseAsync(string message)
+    {
+        // Simply queue up the work we want to do, and return a task completion source to wait on
+        var completion = new TaskCompletionSource();
+        _callbackQueue.Add((() => WriteVerbose(message), completion));
+        return completion.Task;
+    }
+
+    // Here we service the callbacks and also join the task that's been passed in
+    private void AwaitTasksAndRunCallbacks(params Task[] tasks)
+    {
+        var allDone = Task.WhenAll(tasks);
+
+        // Set up a cancellation to allow us to break out of the loop below
+        using (var cancellationSource = new CancellationTokenSource())
+        {
+            // When the tasks complete, we'll cancel the loop
+            allDone.ContinueWith(_ => cancellationSource.Cancel());
+
+            try
+            {
+                // Service the callback queue while we wait for the task to complete
+                foreach ((Action action, TaskCompletionSource completion) callback in _callbackQueue.GetConsumingEnumerable(cancellationSource.Token))
+                {
+                    // Call the desired callback on the pipeline thread
+                    callback.action();
+                    // Now tell the async caller the callback is done
+                    callback.completion.SetResult();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // When the loop is cancelled, we absorb this exception and continue
+            }
+        }
+
+        // Make sure there aren't any unserved callbacks on the next call
+        _callbacks.Clear();
+
+        // Join the tasks back to the pipeline thread, surfacing any exceptions from them
+        allDone.GetAwaiter().GetResult();
+    }
+}
+```
+
+## Special purpose functionality with `PowerShell`
+
+As a final note, for the sake of completeness,
+we should mention the two more specialized functionalities on the `PowerShell` object:
+
+- `PowerShell.GetSteppablePipeline()`
+- `PowerShell.Connect()`/`PowerShell.ConnectAsync()`
+
+Both of these functionalities are quite specialized
+and don't necessarily fit well with the scenarios we've discussed so far.
+But each exists for a purpose, albeit one that it's less likely you'll need to implement.
+
+### `PowerShell.GetSteppablePipeline()` and Steppable pipelines
+
+PowerShell is often noted for its pipeline concept,
+something shared with other shells, if implemented somewhat differently.
+However, usually the noted part of the pipeline feature is the ability to
+break down data processing into discrete steps, passing transformed data from one step to the next.
+What is less talked about is the fact that a pipeline is a form of *lazy* or *by-need* evaluation;
+if a consumer at the end of a pipeline ends early,
+a producer further up can stop before having processed its entire expression.
+
+As an example, consider this filter:
+
+```powershell
+filter PassOn
+{
+    if ($_ -eq 3)
+    {
+        # Write-Host is an immediate side-effect
+        # So we'll see exactly when 2 is hit here
+        Write-Host 'Saw 2'
+    }
+}
+
+1,2,3 | PassOn
+# Prints:
+# 1
+# Saw 2
+# 2
+# 3
+
+1,2,3 | PassOn | Select-Object -First 1
+# Prints:
+# 1
+```
+
+In the second part of the example, `Select-Object` ends the pipeline before the expression `1,2,3` can enumerate all its outputs,
+meaning that `PassOn` never sees 2 and never gets to write `Saw 2` to the host.
+
+In some, more unusual scenarios, we are given a representation of a whole pipeline in PowerShell
+and want to replicate this functionality.
+A great, but little known, example of this is `Invoke-Expression`.
+`Invoke-Expression` is often just treated as executing the PowerShell expression it's given from a string,
+but in fact it uses a steppable pipeline and its behaviour is more subtle,
+which often [leads to confusion due to the unexpected order of execution](https://github.com/PowerShell/PowerShell/issues/11039).
+For example, the following does the obvious thing:
+
+```powershell
+> Invoke-Expression '1;2;Write-Host Hi;3'
+1
+2
+Hi
+3
+```
+
+However, because `Invoke-Expression` actually runs its expression as a steppable pipeline,
+in the next example we see a demonstration that the expression to be invoked
+isn't actually fully evaluated;
+instead, it's evaluated lazily using a steppable pipeline:
+
+```powershell
+> Invoke-Expression '1;2;Write-Host Hi;3' | Select-Object -First 1
+1
+```
+
+Using the `PowerShell.GetSteppablePipeline()` API, you can effect the same behavior,
+allowing your hosting application or cmdlet to step through the evaluation of the constructed PowerShell pipeline.
+
+### `PowerShell.Connect()` and `ConnectAsync()`
+
+The `PowerShell.Connect()` and `ConnectAsync()` methods are also quite unusual APIs,
+designed to essentially resume a connection to a remote runspace that's already had a command run on it.
+This accounts for their slightly odd signature wherein you connect to a session and instantly get output;
+the intent is that the session is one that you began earlier and disconnected from,
+so the output you now get is the delayed output from that session.
+
+Because these APIs are so niche and in fact currently only work over WSMan remoting connections,
+there's not much more to say about them.
+But in very particular scenarios, you may find them useful.
+
+## Summary
+
+We've now looked at just about all the features and intricacies of the `PowerShell` API
+and some related APIs in PowerShell,
+which makes for a surprisingly large amount of information to digest.
+Hopefully we have demystified an API that can at first look simple
+but can present something of a rabbit hole.
+
+The goal of this document is to give you the knowledge you need
+not just to run PowerShell correctly from your application,
+but also to make informed decisions and spot subtle bugs
+around things like runspaces and threads.
+Now that you've read it,
+you should hopefully feel more comfortable doing things like
+managing the input and arguments of scripts you execute from .NET,
+writing cmdlets that invoke scripts and scriptblocks,
+and even using PowerShell with .NET's Task-based Asynchronous Pattern.
+
+Finally, remember that this is a living document and that your feedback is welcomed,
+so if you hit any problems with it or with PowerShell,
+please help us to fix it by opening an issue on GitHub.

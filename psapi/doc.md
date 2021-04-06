@@ -616,9 +616,9 @@ using (var powershell = PowerShell.Create())
 This will print something like:
 
 ```output
-[VRB]: Loading module from path 'C:\Users\Robert Holt\Documents\PowerShell\Modules\Pester\5.1.0\Pester.psd1'.
+[VRB]: Loading module from path 'C:\Users\me\Documents\PowerShell\Modules\Pester\5.1.0\Pester.psd1'.
 [VRB]: Populating RepositorySourceLocation property for module Pester.
-[VRB]: Loading module from path 'C:\Users\Robert Holt\Documents\PowerShell\Modules\Pester\5.1.0\Pester.psm1'.
+[VRB]: Loading module from path 'C:\Users\me\Documents\PowerShell\Modules\Pester\5.1.0\Pester.psm1'.
 [VRB]: Importing function 'Add-ShouldOperator'.
 [VRB]: Importing function 'AfterAll'.
 [VRB]: Importing function 'AfterEach'.
@@ -1230,7 +1230,7 @@ public class InvokeScriptCommand : PSCmdlet
 
 Path
 ----
-C:\Users\Robert Holt\Documents\Dev\misc\psapi
+C:\Users\me\psapi
 
 ```
 

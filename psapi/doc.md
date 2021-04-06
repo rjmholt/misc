@@ -53,6 +53,8 @@ using (var powershell = PowerShell.Create())
 }
 ```
 
+Note that the `-Force` switch parameter is provided by calling `AddParameter()` with only the name argument.
+
 The command invocation is now separated out into the constituent command and parameters.
 This can be preferable simply for readability and validation reasons
 (it's impossible to suffer a syntax error using this structured builder approach),
@@ -303,6 +305,7 @@ To see this in action, compare these two snippets:
 ```csharp
 using (var powershell = PowerShell.Create())
 {
+    // We define $x here, and by default, AddScript() dot-sources its argument
     powershell.AddScript("$x = Get-Command Get-Item").Invoke();
 
     // We'll cover what this means later
@@ -321,6 +324,7 @@ using (var powershell = PowerShell.Create())
 ```csharp
 using (var powershell = PowerShell.Create())
 {
+    // In this case, we set useLocalScope to true, so $x is not defined for the next execution
     powershell.AddScript("$x = Get-Command Get-Item", useLocalScope: true).Invoke();
 
     powershell.Commands.Clear();
@@ -604,6 +608,7 @@ using (var powershell = PowerShell.Create())
     powershell
         .AddCommand("Import-Module")
             .AddParameter("Name", "Pester")
+            .AddParameter("Verbose")
         .Invoke();
 
     foreach (VerboseRecord verboseRecord in powershell.Streams.Verbose)

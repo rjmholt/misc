@@ -14,25 +14,12 @@ namespace psapi
     {
         static void Main(string[] args)
         {
-            using (var powershell = PowerShell.Create())
+            using (var scriptRunner = PowerShellScriptRunner.Create(maxRunspaces: 1))
             {
-                var dataCollection = new PSDataCollection<PSObject>();
-                Task<PSDataCollection<PSObject>> psTask = powershell.AddScript("1..10 | % { $_; sleep 1 }").InvokeAsync(dataCollection);
+                var cancellationSource = new CancellationTokenSource(2000);
+                Task<PSDataCollection<PSObject>> task = scriptRunner.RunScriptAsync("Sleep 10; 'Hello'", cancellationSource.Token);
 
-                Thread.Sleep(2000);
-
-                powershell.Stop();
-
-                try
-                {
-                    psTask.GetAwaiter().GetResult();
-                }
-                catch (PipelineStoppedException)
-                {
-
-                }
-
-                foreach (PSObject result in dataCollection)
+                foreach (PSObject result in task.GetAwaiter().GetResult())
                 {
                     Console.WriteLine(result);
                 }
@@ -40,64 +27,70 @@ namespace psapi
         }
     }
 
-    class PowerShellScriptRunner : IDisposable
+class PowerShellScriptRunner : IDisposable
+{
+    public static PowerShellScriptRunner Create(int maxRunspaces)
     {
-        public static PowerShellScriptRunner Create(int maxRunspaces)
-        {
-            var runspacePool = RunspaceFactory.CreateRunspacePool(1, maxRunspaces);
-            runspacePool.Open();
-            return new PowerShellScriptRunner(runspacePool);
-        }
+        RunspacePool runspacePool = RunspaceFactory.CreateRunspacePool(minRunspaces: 1, maxRunspaces);
+        runspacePool.Open();
+        return new PowerShellScriptRunner(runspacePool);
+    }
 
-        private readonly RunspacePool _runspacePool;
-        private bool _disposedValue;
+    private readonly RunspacePool _runspacePool;
+    private bool _disposedValue;
 
-        public PowerShellScriptRunner(RunspacePool runspacePool)
-        {
-            _runspacePool = runspacePool;
-        }
+    protected PowerShellScriptRunner(RunspacePool runspacePool)
+    {
+        _runspacePool = runspacePool;
+    }
 
-        public Task<IReadOnlyList<T>> RunScriptAsync<T>(string script, CancellationToken cancellationToken)
-        {
-            var powershell = PowerShell.Create();
-            powershell.RunspacePool = _runspacePool;
+    public Task<PSDataCollection<PSObject>> RunScriptAsync(string script, CancellationToken cancellationToken)
+    {
+        var powershell = PowerShell.Create();
+        powershell.RunspacePool = _runspacePool;
+        cancellationToken.Register(() => powershell.Stop());
 
-            // If this async call is cancelled, then this PowerShell run will be cancelled
-            cancellationToken.Register(() => powershell.Stop());
-
-            powershell.AddScript(script);
-
-            return powershell.InvokeAsync()
-                .ContinueWith(psTask =>
-                {
-                    powershell.Dispose();
-
-                    var list = new List<T>();
-                    foreach (PSObject result in psTask.Result)
-                    {
-                        list.Add((T)result.BaseObject);
-                    }
-                    return (IReadOnlyList<T>)list;
-                });
-        }
-
-        protected virtual void Dispose(bool disposing)
-        {
-            if (!_disposedValue)
+        return powershell
+            .AddScript(script)
+            .InvokeAsync()
+            .ContinueWith(psTask =>
             {
-                if (disposing)
+                // Dispose of PowerShell asynchronously
+                powershell.Dispose();
+
+                PSDataCollection<PSObject> results = null;
+                try
                 {
-                    _runspacePool.Dispose();
+                    results = psTask.GetAwaiter().GetResult();
+                }
+                catch (PipelineStoppedException e)
+                {
+                    // Convert the PipelineStoppedException into an OperationCanceledException
+                    // to conform better to the TAP API expectation
+                    throw new OperationCanceledException($"Execution of PowerShell script canceled", e);
                 }
 
-                _disposedValue = true;
-            }
-        }
+                return results;
+            });
+    }
 
-        public void Dispose()
+    protected virtual void Dispose(bool disposing)
+    {
+        if (!_disposedValue)
         {
-            Dispose(disposing: true);
-            GC.SuppressFinalize(this);
+            if (disposing)
+            {
+                _runspacePool.Dispose();
+            }
+
+            _disposedValue = true;
         }
     }
+
+    public void Dispose()
+    {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
+    }
+}
 }

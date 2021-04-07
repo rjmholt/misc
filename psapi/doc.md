@@ -2458,43 +2458,135 @@ Unhandled exception. System.Management.Automation.PipelineStoppedException: The 
    at psapi.Program.Main(String[] args) in C:\Users\me\psapi\Program.cs:line 25
 ```
 
-This is something of a limitation of the asynchronous API, but worth being aware of.
-The standard trick in situations like this is to pass in a `PSDataCollection<PSObject>` to collect any output,
-however behavior with this can vary.
+This is something to be aware of in the asynchronous API; cancelling a running command will throw a `PipelineStoppedException`.
+This isn't too far from a standard `async` call throwing an `OperationCanceledException`,
+and if you want the partial result it's still available with the right configuration.
+The trick is to provide a `PSDataCollection<T>` for the results you want:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    // Kick off our PowerShell command
+    var output = new PSDataCollection<PSObject>();
+
+    // This event can be used to process output as it's emitted, rather than after execution has finished
+    output.DataAdded += (sender, args) => {
+        Console.WriteLine($"Output added: {output[args.Index]}");
+    };
+
+    Task<PSDataCollection<PSObject>> task = powershell.AddScript("1;2;3;Start-Sleep 10;4;5;6").InvokeAsync<PSObject, PSObject>(input: null, output);
+
+    // Sleep for 2 seconds
+    Thread.Sleep(2000);
+
+    // Now stop PowerShell
+    powershell.Stop();
+
+    // Try to collect results
+    PSDataCollection<PSObject> results = null;
+    try
+    {
+        results = task.GetAwaiter().GetResult();
+    }
+    catch (PipelineStoppedException)
+    {
+        Console.WriteLine("Pipeline stopped");
+    }
+
+    // If we have any results, print them
+    if (results is not null)
+    {
+        Console.WriteLine("PowerShell results:");
+        foreach (PSObject result in results)
+        {
+            Console.WriteLine(result);
+        }
+    }
+
+    // Now print the contents of our supplied output collection
+    Console.WriteLine("Output contents:");
+    foreach (PSObject item in output)
+    {
+        Console.WriteLine(item);
+    }
+}
+```
 
 But now let's create a more practical example: an asynchronous runner object that can execute scripts but allow cancelling them too:
 
 ```csharp
-class PowerShellScriptRunner
+class PowerShellScriptRunner : IDisposable
 {
     public static PowerShellScriptRunner Create(int maxRunspaces)
     {
         RunspacePool runspacePool = RunspaceFactory.CreateRunspacePool(minRunspaces: 1, maxRunspaces);
+        runspacePool.Open();
         return new PowerShellScriptRunner(runspacePool);
     }
 
     private readonly RunspacePool _runspacePool;
+    private bool _disposedValue;
 
     protected PowerShellScriptRunner(RunspacePool runspacePool)
     {
         _runspacePool = runspacePool;
     }
 
-    public Task<PSObject> RunScriptAsync(string script, CancellationToken cancellationToken)
+    public Task<PSDataCollection<PSObject>> RunScriptAsync(string script, CancellationToken cancellationToken)
     {
-        // We're using the Task.Run() + synchronous invocation here since Stop() works nicely with it
-        return Task.Run(() =>
-        {
-            using (var powershell = PowerShell.Create())
+        // Create the PowerShell object
+        var powershell = PowerShell.Create();
+        // Get it to use our runspace pool
+        powershell.RunspacePool = _runspacePool;
+        // Link our TAP cancellation token to the PowerShell.Stop() method,
+        // so that cancelling this command the .NET way will stop PowerShell running
+        cancellationToken.Register(() => powershell.Stop());
+
+        return powershell
+            .AddScript(script)
+            .InvokeAsync()
+            .ContinueWith(psTask =>
             {
-                powershell.RunspacePool = _runspacePool;
+                // Dispose of PowerShell asynchronously
+                powershell.Dispose();
 
-                // We can hook up the cancellation token to trigger the PowerShell.Stop() call quite easily like this
-                cancellationToken.Register(() => powershell.Stop());
+                // Collect the results here.
+                // Since .NET expects this to throw when cancelled,
+                // we don't need to bother collecting partial results
+                PSDataCollection<PSObject> results = null;
+                try
+                {
+                    results = psTask.GetAwaiter().GetResult();
+                }
+                catch (PipelineStoppedException e)
+                {
+                    // Convert the PipelineStoppedException into an OperationCanceledException
+                    // to conform better to the TAP API expectation
+                    throw new OperationCanceledException($"Execution of PowerShell script canceled", e);
+                }
 
-                return powershell.AddScript(script).Invoke();
+                return results;
+            });
+    }
+
+    // Make sure we dispose of the runspace pool properly
+    protected virtual void Dispose(bool disposing)
+    {
+        if (!_disposedValue)
+        {
+            if (disposing)
+            {
+                _runspacePool.Dispose();
             }
-        });
+
+            _disposedValue = true;
+        }
+    }
+
+    public void Dispose()
+    {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
     }
 }
 ```

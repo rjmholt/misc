@@ -127,6 +127,60 @@ using (var powershell = PowerShell.Create())
 }
 ```
 
+#### Invoking commands other than cmdlets
+
+One thing to take note of here is that the `AddCommand()` call
+will take *anything* that works as a PowerShell command;
+it is effectively equivalent to `& '<command>'` in PowerShell script.
+This means you can invoke scripts on the filesystem by path (just like an ordinary function),
+or indeed native commands (using `AddArgument()` to set arguments positionally).
+
+For example we could call a script like this:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    // Execute: & 'D:\My Scripts\runBackup.ps1' -OutputLocation 'Z:\Backups'
+    powershell
+        .AddCommand("D:\\My Scripts\\runBackup.ps1")
+        .AddParameter("OutputLocation", "Z:\\Backups")
+        .Invoke();
+}
+```
+
+Or call `robocopy` like this:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    // Execute: robocopy 'C:\Users\me\Desktop' 'D:\My Backups\desktop_backup' /e
+    powershell
+        .AddCommand("robocopy")
+        .AddArgument("C:\\Users\\me\\Desktop")
+        .AddArgument("D:\\My Backups\\desktop_backup")
+        .AddArgument("/e")
+        .Invoke();
+
+    // Note that the output of a native command is always a sequence of strings.
+    // So in this example you'll get a big collection of all of robocopy's pretty printed output, line by line
+}
+```
+
+Or possibly use `rsync` on a *nix system:
+
+```csharp
+using (var powershell = PowerShell.Create())
+{
+    // Execute: rsync -avzh /root/tar_pkgs /tmp/backups
+    powershell
+        .AddCommand("rsync")
+        .AddArgument("-avzh")
+        .AddArgument("/root/tar_pkgs")
+        .AddArgument("/tmp/backups)
+        .Invoke();
+}
+```
+
 ### Getting output from PowerShell invocations
 
 So far we've discussed executing PowerShell from .NET and passing arguments in,

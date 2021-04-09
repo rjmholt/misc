@@ -12,7 +12,7 @@ using System.Threading.Tasks;
 
 namespace psapi
 {
-    [Cmdlet(VerbsLifecycle.Invoke, "Example")]
+    [Cmdlet(VerbsLifecycle.Invoke, "OtherExample")]
     public class InvokeExampleCommand : PSCmdlet
     {
         private readonly ConcurrentQueue<(Action, TaskCompletionSource)> _callbacks;

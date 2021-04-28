@@ -176,7 +176,7 @@ using (var powershell = PowerShell.Create())
         .AddCommand("rsync")
         .AddArgument("-avzh")
         .AddArgument("/root/tar_pkgs")
-        .AddArgument("/tmp/backups)
+        .AddArgument("/tmp/backups")
         .Invoke();
 }
 ```

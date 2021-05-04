@@ -2198,44 +2198,35 @@ async Task ExecuteAsync()
     }
 }
 
-Task<Collection<T>> RunPowerShellAsync<T>(PSCommand command)
+async Task<Collection<T>> RunPowerShellAsync<T>(PSCommand command)
 {
-    // Note the big problem here:
-    // In synchronous contexts we'd use a `using` statement
-    // to dispose of PowerShell when it's done.
-    // Now we're asynchronous, we need to get smarter
-    var powershell = PowerShell.Create();
+    PSDataCollection<PSObject> results = null;
+    using (var powershell = PowerShell.Create())
+    {
 
-    powershell.Commands = command;
+        powershell.Commands = command;
 
-    // Task.Factory.FromAsync is .NET's helpful method for converting APM APIs to TAP ones
-    //
-    // Note that we're forced to use PSDataCollection<PSObject> rather than PSDataCollection<T>
-    // because PowerShell.EndInvoke() does not have a generic form.
-    return Task<PSDataCollection<PSObject>>.Factory.FromAsync(
-        (callback, state) => powershell.BeginInvoke(
-            new PSDataCollection<PSObject>(),
-            new PSInvocationSettings(), // We have to provide invocation settings for this override, but the default value works as we expect
-            callback,
-            state),
-        powershell.EndInvoke,
-        state: null)
-        .ContinueWith(psTask =>
-        {
-            // Here's where we dispose of PowerShell
-            // ContinueWith() is called after the invocation is done (and whether it failed or not),
-            // so this is the right place to dispose of the PowerShell instance
-            powershell.Dispose();
+        // Task.Factory.FromAsync is .NET's helpful method for converting APM APIs to TAP ones
+        //
+        // Note that we're forced to use PSDataCollection<PSObject> rather than PSDataCollection<T>
+        // because PowerShell.EndInvoke() does not have a generic form.
+        results = await Task<PSDataCollection<PSObject>>.Factory.FromAsync(
+            (callback, state) => powershell.BeginInvoke(
+                new PSDataCollection<PSObject>(),
+                new PSInvocationSettings(), // We have to provide invocation settings for this override, but the default value works as we expect
+                callback,
+                state),
+            powershell.EndInvoke,
+            state: null)
+            .ConfigureAwait(false);
+    }
 
-            // Because of the lack of an EndInvoke() generic above,
-            // we have to manually transfer our results to a new, strongly-typed collection
-            var results = new List<T>(psTask.Result.Count);
-            foreach (PSObject result in psTask.Result)
-            {
-                results.Add((T)result.BaseObject);
-            }
-            return new Collection<T>(results);
-        });
+    var returnedResults = new List<T>(results.Count);
+    foreach (PSObject result in results)
+    {
+        returnedResults.Add((T)result.BaseObject);
+    }
+    return new Collection<T>(returnedResults);
 }
 ```
 
@@ -2244,27 +2235,22 @@ Of course, it would be nicer if `PowerShell` just provided an `InvokeAsync()` me
 and in PowerShell 7 it does:
 
 ```csharp
-Task<Collection<T>> RunPowerShellAsync<T>(PSCommand command)
+async Task<Collection<T>> RunPowerShellAsync<T>(PSCommand command)
 {
-    // We still have the disposal problem, which we'll solve again in much the same way
-    var powershell = PowerShell.Create();
+    PSDataCollection<PSObject> results = null;
+    using (var powershell = PowerShell.Create())
+    {
+        powershell.Commands = command;
 
-    powershell.Commands = command;
+        results = await powershell.InvokeAsync().ConfigureAwait(false);
+    }
 
-    return powershell.InvokeAsync<T>(new PSDataCollection<T>())
-        .ContinueWith(psTask =>
-        {
-            // Dispose of PowerShell after execution
-            powershell.Dispose();
-
-            // Note we also have to perform the conversion manually
-            var list = new List<T>(psTask.Result.Count);
-            foreach (PSObject result in psTask.Result)
-            {
-                list.Add((T)result.BaseObject);
-            }
-            return new Collection<T>(list);
-        });
+    var resultList = new List<T>(results.Count);
+    foreach (PSObject result in results)
+    {
+        resultList.Add((T)result.BaseObject);
+    }
+    return resultList;
 }
 ```
 
@@ -2318,42 +2304,32 @@ class PowerShellParallelRunner : IDisposable
 
     public Task<Collection<PSObject>> RunPowerShellAsync(PSCommand command)
     {
-        var powershell = PowerShell.Create();
-        powershell.RunspacePool = _runspacePool;
-        powershell.Commands = command;
+        using (var powershell = PowerShell.Create())
+        {
+            powershell.RunspacePool = _runspacePool;
+            powershell.Commands = command;
 
-        return powershell.InvokeAsync()
-            .ContinueWith(psTask =>
-            {
-                powershell.Dispose();
-
-                var results = new List<PSObject>(psTask.Result.Count);
-                foreach (PSObject result in psTask.Result)
-                {
-                    results.Add(result);
-                }
-                return new Collection<PSObject>(results);
-            });
+            PSDataCollection<PSObject> results = await powershell.InvokeAsync().ConfigureAwait(false);
+            return new Collection<PSObject>(results);
+        }
     }
 
     public Task<Collection<T>> RunPowerShellAsync<T>(PSCommand command)
     {
-        var powershell = PowerShell.Create();
-        powershell.RunspacePool = _runspacePool;
-        powershell.Commands = command;
+        using (var powershell = PowerShell.Create())
+        {
+            powershell.RunspacePool = _runspacePool;
+            powershell.Commands = command;
 
-        return powershell.InvokeAsync<T>(new PSDataCollection<T>())
-            .ContinueWith(psTask =>
+            PSDataCollection<PSObject> results = await powershell.InvokeAsync().ConfigureAwait(false);
+
+            var list = new List<T>(results.Count);
+            foreach (PSObject result in results)
             {
-                powershell.Dispose();
-
-                var results = new List<T>(psTask.Result.Count);
-                foreach (PSObject result in psTask.Result)
-                {
-                    results.Add((T)result.BaseObject);
-                }
-                return new Collection<T>(results);
-            });
+                list.Add((T)result.BaseObject);
+            }
+            return new Collection<T>(list);
+        }
     }
 
     protected virtual void Dispose(bool disposing)

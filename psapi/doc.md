@@ -2562,41 +2562,31 @@ class PowerShellScriptRunner : IDisposable
         _runspacePool = runspacePool;
     }
 
-    public Task<PSDataCollection<PSObject>> RunScriptAsync(string script, CancellationToken cancellationToken)
+    public async Task<PSDataCollection<PSObject>> RunScriptAsync(string script, CancellationToken cancellationToken)
     {
         // Create the PowerShell object
-        var powershell = PowerShell.Create();
-        // Get it to use our runspace pool
-        powershell.RunspacePool = _runspacePool;
-        // Link our TAP cancellation token to the PowerShell.Stop() method,
-        // so that cancelling this command the .NET way will stop PowerShell running
-        cancellationToken.Register(() => powershell.Stop());
+        using (var powershell = PowerShell.Create())
+        {
+            // Get it to use our runspace pool
+            powershell.RunspacePool = _runspacePool;
+            // Link our TAP cancellation token to the PowerShell.Stop() method,
+            // so that cancelling this command the .NET way will stop PowerShell running
+            cancellationToken.Register(() => powershell.Stop());
 
-        return powershell
-            .AddScript(script)
-            .InvokeAsync()
-            .ContinueWith(psTask =>
+            try
             {
-                // Dispose of PowerShell asynchronously
-                powershell.Dispose();
-
-                // Collect the results here.
-                // Since .NET expects this to throw when cancelled,
-                // we don't need to bother collecting partial results
-                PSDataCollection<PSObject> results = null;
-                try
-                {
-                    results = psTask.GetAwaiter().GetResult();
-                }
-                catch (PipelineStoppedException e)
-                {
-                    // Convert the PipelineStoppedException into an OperationCanceledException
-                    // to conform better to the TAP API expectation
-                    throw new OperationCanceledException($"Execution of PowerShell script canceled", e);
-                }
-
-                return results;
-            });
+                return await powershell
+                    .AddScript(script)
+                    .InvokeAsync()
+                    .ConfigureAwait(false);
+            }
+            catch (PipelineStoppedException e)
+            {
+                // Convert the PipelineStoppedException into an OperationCanceledException
+                // to conform better to the TAP API expectation
+                throw new OperationCanceledException($"Execution of PowerShell script canceled", e);
+            }
+        }
     }
 
     // Make sure we dispose of the runspace pool properly

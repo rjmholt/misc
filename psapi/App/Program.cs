@@ -20,15 +20,16 @@ namespace psapi
     {
         static void Main(string[] args)
         {
-            if (args[0].Equals("server", StringComparison.OrdinalIgnoreCase))
+            if (args.Length == 0)
             {
-                RunServer(args.Skip(1).ToArray());
+                Talk.Run();
                 return;
             }
 
-            if (args[0].Equals("talk", StringComparison.OrdinalIgnoreCase))
+
+            if (args[0].Equals("server", StringComparison.OrdinalIgnoreCase))
             {
-                Talk.Run();
+                RunServer(args.Skip(1).ToArray());
                 return;
             }
 
@@ -73,7 +74,7 @@ namespace psapi
         public void ConfigureServices(IServiceCollection services)
         {
             services.AddControllers();
-            services.AddSingleton<IPowerShellService>(serviceProvider => ExamplePowerShellService.Create(maxRunspaces: 10));
+            services.AddSingleton<IPowerShellService>(serviceProvider => PowerShellService.Create(maxRunspaces: 10));
         }
 
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env)

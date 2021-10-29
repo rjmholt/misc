@@ -1,7 +1,12 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Linq;
 using System.Management.Automation;
+using System.Management.Automation.Runspaces;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace psapi
 {
@@ -9,18 +14,6 @@ namespace psapi
     {
         public static void Run()
         {
-            using (var powershell = PowerShell.Create())
-            {
-                Collection<int> results = powershell
-                    .AddCommand("Where-Object")
-                        .AddArgument(ScriptBlock.Create("$_ -gt 2"))
-                    .Invoke<int>(input: new [] { 1, 2, 3, 4, 5 });
-
-                foreach (int result in results)
-                {
-                    Console.WriteLine(result);
-                }
-            }
         }
     }
 }
